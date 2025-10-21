@@ -1,11 +1,8 @@
-from datetime import date
-import pathlib
+f"""# Baseline Report — OCR Threshold Optimization
 
-report = f"""# Baseline Report — OCR Threshold Optimization
-
-**Date:** {date.today().isoformat()}  
+**Date:** October 21st, 2025
 **Version:** v1.0  
-**Author:** (add your name here)
+**Author:** Katie Hannigan
 
 ---
 

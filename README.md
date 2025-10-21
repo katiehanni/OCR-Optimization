@@ -1,4 +1,4 @@
-f"""# Baseline Report — OCR Threshold Optimization
+# Baseline Report — OCR Threshold Optimization
 
 **Date:** October 21st, 2025
 **Version:** v1.0  

@@ -1,1 +1,10 @@
-{"tau": 78, "type": "platt"}
+{
+  "tau": 77,
+  "type": "isotonic",
+  "window_days": 30,
+  "lam": 0.2,
+  "val_size": 240,
+  "brier": 0.038493341406219315,
+  "logloss": 0.17285437786692212,
+  "timestamp_max": "2025-12-20T00:00:00"
+}

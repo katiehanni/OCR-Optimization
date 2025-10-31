@@ -1,0 +1,85 @@
+<<<<<<< HEAD
+=======
+# Baseline Report — OCR Threshold Optimization
+
+**Date:** October 21st, 2025
+**Version:** v1.0  
+**Author:** Katie Hannigan
+
+---
+
+## Experiment Metadata
+| Setting | Value | Notes |
+|----------|--------|-------|
+| Date | 2025-10-21 | Baseline run |
+| Version | v1.0 | Increment when re-running pipeline |
+| Dataset size | n = 5000 | Simulated OCR batch |
+| Drift config | Δτ = 0, Δslope = 0.0 | Used for baseline test |
+| Train / Validation split | 80 / 20 | Time-based split |
+| λ (review-cost weight) | 0.2 | Penalty term in utility function |
+
+---
+
+## Model Configuration
+| Component | Setting | Description |
+|------------|----------|-------------|
+| Calibration algorithm | Isotonic Regression | Maps OCR score to calibrated P(correct) |
+| Alternative model tested | Logistic Regression (Platt Scaling) | Simpler sigmoid calibration |
+| Reviewer weighting | Beta–Bernoulli posterior mean | Weights reviewers by reliability |
+| Threshold optimization | Utility = Accuracy – λ × ReviewRate | Searches thresholds 0–99 |
+| Probability cutoff (optional) | P(correct) ≥ 0.95 | Defines stricter "auto-accept" mode |
+
+---
+
+## Results Summary
+| Metric | Value | Meaning |
+|---------|--------|---------|
+| Best τ (utility-optimal) | 78 | Learned decision threshold |
+| Accuracy at τ | ≈ 0.93 | Overall system accuracy |
+| Review rate | ≈ 0.79 | Percentage routed to human review |
+| Utility | ≈ 0.77 | Combined accuracy–cost score |
+| Probability-cut τ | 99 | Risk-averse acceptance cutoff |
+| Calibrator type used | Isotonic Regression | Chosen by lowest Brier/LogLoss |
+| Reviewer reliabilities | A ≈ 0.95, B ≈ 0.85, C ≈ 0.70 | Estimated from audits |
+| Validation utility loss | 0 % | Perfect generalization on new batch |
+
+---
+
+## Artifacts
+| File | Description |
+|------|--------------|
+| artifacts/calibrator.pkl | Saved calibration model |
+| artifacts/threshold.json | Saved τ configuration |
+| plots/score_distribution.html | OCR score distribution |
+| plots/accuracy_vs_score.html | Accuracy vs. score reliability curve |
+| plots/utility_vs_threshold.html | Utility optimization visualization |
+| plots/accuracy_review_vs_threshold.html | Accuracy & review trade-off curve |
+
+---
+
+## Key Visuals
+1. **Score Distribution:** histogram of OCR confidence scores.  
+2. **Empirical Accuracy by Score:** higher scores → higher correctness.  
+3. **Utility vs. Threshold:** blue dashed line at optimal τ ≈ 78.  
+4. **Accuracy & Review Rate vs. Threshold:** visualizes trade-off balance.
+
+---
+
+## Interpretation
+- The OCR model’s confidence scores are informative and approximately monotonic with correctness.  
+- Isotonic calibration produced the best probability mapping (lowest Brier and LogLoss).  
+- The optimal decision threshold τ ≈ 78 balances accuracy (≈ 93 %) and human review load (≈ 79 %) for λ = 0.2.  
+- Validation on a new batch showed 0 % utility loss, confirming stability.  
+
+---
+
+## Next Steps
+- Freeze this configuration as **baseline v1.0**.  
+- Implement **online updating** (rolling 30-day recalibration).  
+- Add **drift monitoring** for τ, utility, and calibration loss.  
+- Track **reviewer reliability** over time.  
+- Run **λ-sensitivity analysis** (λ = 0.1 – 0.5).  
+
+---
+
+>>>>>>> dbdb7140673c743c51d1121acafd522a889e14b6

@@ -36,7 +36,7 @@ We transform ordinal OCR scores into **calibrated probabilities** \( \hat{p}_i =
 | Calibrator | Description | Type |
 |-------------|--------------|------|
 | **Isotonic Regression** | Non-parametric, piecewise-constant monotonic mapping | Non-parametric |
-| **Platt Scaling** | Logistic regression: \( f_{\text{platt}}(s) = \frac{1}{1 + e^{-(\alpha + \beta s)}} \) | Parametric |
+| **Platt Scaling** | Logistic regression: $f_{\text{platt}}(s) = \frac{1}{1 + e^{-(\alpha + \beta s)}}$ | Parametric |
 
 The chosen calibrator minimizes **Brier score** and **log-loss** on held-out validation data.
 

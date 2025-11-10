@@ -1,85 +1,186 @@
-<<<<<<< HEAD
-=======
-# Baseline Report — OCR Threshold Optimization
+# OCR Threshold Optimization — v1.0
 
-**Date:** October 21st, 2025
-**Version:** v1.0  
-**Author:** Katie Hannigan
+## Overview  
+This project introduces a data-driven calibration and threshold optimization pipeline for Optical Character Recognition (OCR) confidence scores.  
+The goal is to automatically determine and adapt an optimal confidence threshold \( \tau \) that balances **accuracy** and **human review cost**, replacing prior heuristic or Bayesian thresholding methods.
 
 ---
 
-## Experiment Metadata
-| Setting | Value | Notes |
-|----------|--------|-------|
-| Date | 2025-10-21 | Baseline run |
-| Version | v1.0 | Increment when re-running pipeline |
-| Dataset size | n = 5000 | Simulated OCR batch |
-| Drift config | Δτ = 0, Δslope = 0.0 | Used for baseline test |
-| Train / Validation split | 80 / 20 | Time-based split |
-| λ (review-cost weight) | 0.2 | Penalty term in utility function |
+## 1. Motivation  
+
+Traditional OCR systems rely on raw model confidence scores to decide whether to **auto-accept** or **send to manual review**.  
+However, these scores are *ordinal* and not directly probabilistic — a score of 85 does not necessarily mean an 85% chance of correctness.  
+
+The original idea was that a Bayesian prior could be used to adjust this, but it was static and required manual tuning.  
+Our new data-driven approach directly learns calibration and threshold behavior from observed performance data.
 
 ---
 
-## Model Configuration
-| Component | Setting | Description |
-|------------|----------|-------------|
-| Calibration algorithm | Isotonic Regression | Maps OCR score to calibrated P(correct) |
-| Alternative model tested | Logistic Regression (Platt Scaling) | Simpler sigmoid calibration |
-| Reviewer weighting | Beta–Bernoulli posterior mean | Weights reviewers by reliability |
-| Threshold optimization | Utility = Accuracy – λ × ReviewRate | Searches thresholds 0–99 |
-| Probability cutoff (optional) | P(correct) ≥ 0.95 | Defines stricter "auto-accept" mode |
+## 2. Approach Summary  
+
+### Step 1 — Generate or Ingest OCR Data
+
+Each document *i* has:
+
+- OCR confidence score **sᵢ ∈ [0, 99]**  
+- Ground-truth correctness label **yᵢ ∈ {0, 1}**  
+- Optional reviewer label **rᵢ** and timestamp **tᵢ**  
+
+Synthetic data is used for initial testing, with a configurable **“true” sigmoid probability curve** controlling the likelihood of correctness.
 
 ---
 
-## Results Summary
-| Metric | Value | Meaning |
-|---------|--------|---------|
-| Best τ (utility-optimal) | 78 | Learned decision threshold |
-| Accuracy at τ | ≈ 0.93 | Overall system accuracy |
-| Review rate | ≈ 0.79 | Percentage routed to human review |
-| Utility | ≈ 0.77 | Combined accuracy–cost score |
-| Probability-cut τ | 99 | Risk-averse acceptance cutoff |
-| Calibrator type used | Isotonic Regression | Chosen by lowest Brier/LogLoss |
-| Reviewer reliabilities | A ≈ 0.95, B ≈ 0.85, C ≈ 0.70 | Estimated from audits |
-| Validation utility loss | 0 % | Perfect generalization on new batch |
+### Step 2 — Calibration  
+We transform ordinal OCR scores into **calibrated probabilities** \( \hat{p}_i = P(y_i = 1 \mid s_i) \) using two approaches:
+
+| Calibrator | Description | Type |
+|-------------|--------------|------|
+| **Isotonic Regression** | Non-parametric, piecewise-constant monotonic mapping | Non-parametric |
+| **Platt Scaling** | Logistic regression: \( f_{\text{platt}}(s) = \frac{1}{1 + e^{-(\alpha + \beta s)}} \) | Parametric |
+
+The chosen calibrator minimizes **Brier score** and **log-loss** on held-out validation data.
 
 ---
 
-## Artifacts
-| File | Description |
-|------|--------------|
-| artifacts/calibrator.pkl | Saved calibration model |
-| artifacts/threshold.json | Saved τ configuration |
-| plots/score_distribution.html | OCR score distribution |
-| plots/accuracy_vs_score.html | Accuracy vs. score reliability curve |
-| plots/utility_vs_threshold.html | Utility optimization visualization |
-| plots/accuracy_review_vs_threshold.html | Accuracy & review trade-off curve |
+### Step 3 — Threshold Optimization
+
+For each candidate threshold **τ**:
+
+$$
+\text{Utility}(\tau) = \text{Accuracy}(\tau) - \lambda \times \text{ReviewRate}(\tau)
+$$
+
+where:
+
+- **τ**: decision threshold  
+- **λ ∈ [0, 1]**: review-cost penalty  
+- **Accuracy(τ)**: proportion of auto-accepted documents that are correct  
+- **ReviewRate(τ)**: fraction of documents routed to review  
+
+The optimal threshold **τ\*** maximizes this utility function.  
+We typically find **τ\* ≈ 78–80** balances performance for moderate review cost (**λ = 0.2**).
 
 ---
 
-## Key Visuals
-1. **Score Distribution:** histogram of OCR confidence scores.  
-2. **Empirical Accuracy by Score:** higher scores → higher correctness.  
-3. **Utility vs. Threshold:** blue dashed line at optimal τ ≈ 78.  
-4. **Accuracy & Review Rate vs. Threshold:** visualizes trade-off balance.
+### Step 4 — Online Updating
+
+A rolling **30-day calibration window** allows the model to adapt dynamically to production drift:
+
+- ↓ **τ** → OCR accuracy is improving  
+- ↑ **τ** → OCR confidence reliability is decaying  
+- Summary metrics (**Brier**, **LogLoss**) track calibration quality  
+- Reviewer reliability weights are updated using **Beta–Bernoulli posteriors**
 
 ---
 
-## Interpretation
-- The OCR model’s confidence scores are informative and approximately monotonic with correctness.  
-- Isotonic calibration produced the best probability mapping (lowest Brier and LogLoss).  
-- The optimal decision threshold τ ≈ 78 balances accuracy (≈ 93 %) and human review load (≈ 79 %) for λ = 0.2.  
-- Validation on a new batch showed 0 % utility loss, confirming stability.  
+## 3. Key Results  
+
+| Metric | Value | Notes |
+|---------|--------|-------|
+| **Optimal threshold (τ\*) | ≈ 78 | Balances 84% accuracy, 65% review rate |
+| Accuracy at τ | 0.84 | On validation set |
+| Review rate | 0.65 | Documents sent for manual review |
+| Utility | 0.71 | Combined metric |
+| Calibrator | Isotonic | Chosen by lowest log-loss |
+| Validation utility loss | 0% | Perfect generalization (synthetic) |
+
+**Interpretation:**  
+A threshold near 78 auto-accepts ~35% of documents while maintaining ~84% accuracy, achieving an optimal utility trade-off.
 
 ---
 
-## Next Steps
-- Freeze this configuration as **baseline v1.0**.  
-- Implement **online updating** (rolling 30-day recalibration).  
-- Add **drift monitoring** for τ, utility, and calibration loss.  
-- Track **reviewer reliability** over time.  
-- Run **λ-sensitivity analysis** (λ = 0.1 – 0.5).  
+## 4. Example Visuals  
+
+| Visualization | Description |
+|----------------|--------------|
+| **Histogram of OCR Scores** | Distribution of confidence outputs |
+| **Empirical Accuracy by Score Bin** | Shows non-linearity before calibration |
+| **Utility vs. Threshold τ** | Identifies utility-optimal τ |
+| **τ Drift Over Time** | Monitors model calibration drift |
+| **λ Sensitivity Curve** | Effect of increasing review-cost penalty |
 
 ---
 
->>>>>>> dbdb7140673c743c51d1121acafd522a889e14b6
+## 5. Next Steps  
+
+- Freeze this configuration as **Baseline v1.0**  
+- Implement **online recalibration** using production OCR logs  
+- Extend **reviewer reliability tracking** (via Bayesian posteriors)  
+- Add **adaptive λ tuning** for variable cost environments  
+- Integrate into **QuickSight or Streamlit dashboard** for real-time monitoring  
+
+---
+
+## 7. Dependencies  
+
+- Python ≥ 3.10  
+- pandas, numpy  
+- scikit-learn (for calibration models)  
+- plotly (for visualization)  
+- joblib (for model serialization)
+
+---
+
+## 8. Mathematical Appendix
+
+### Calibration
+
+Raw OCR scores are ordinal. A **monotonic calibration function** maps them to probabilities:
+
+$$
+\hat{p}_i = f(s_i) = P(y_i = 1 \mid s_i)
+$$
+
+Two calibration methods are supported:
+
+- **Isotonic Regression** — piecewise-constant, non-parametric mapping  
+- **Platt Scaling** — parametric logistic form  
+
+$$
+f_{\text{platt}}(s) = \frac{1}{1 + e^{-(\alpha + \beta s)}}
+$$
+
+The model that minimizes the **Brier score** and **log-loss** on validation data is selected.
+
+---
+
+### Reviewer Weighting
+
+Reviewer reliability is estimated via a **Beta–Bernoulli model**:
+
+$$
+\alpha_r = 1 + \text{count(correct reviews by reviewer } r)
+$$
+
+$$
+\beta_r = 1 + \text{count(incorrect reviews by reviewer } r)
+$$
+
+Reviewer weight:
+
+$$
+w_r = \frac{\alpha_r}{\alpha_r + \beta_r}
+$$
+
+---
+
+### Threshold Utility
+
+Decision rule based on maximizing expected utility:
+
+$$
+U(\tau) = \text{Accuracy}(\tau) - \lambda \times \text{ReviewRate}(\tau)
+$$
+
+Optimal threshold:
+
+$$
+\tau^* = \arg\max_{\tau} U(\tau)
+$$
+
+---
+
+## 9. Authors & Notes  
+**Author:** Katie Hannigan  
+**Contributors:** David Casale 
+**Last Updated:** November 2025  

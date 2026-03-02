@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import csv
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -17,19 +18,39 @@ from dash import Dash, Input, Output, State, callback_context, dcc, html, no_upd
 
 BOOTSTRAP = "https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
 
-THRESHOLD_DEFAULT = 0.78
-THRESHOLD_MIN = 0.50
-THRESHOLD_MAX = 0.95
+THRESHOLD_DEFAULT = 80.0
+THRESHOLD_MIN = 1.0
+THRESHOLD_MAX = 99.0
 LAMBDA_REVIEW = 0.20
-ADAPTIVE_THRESHOLD_DEFAULT = 0.72
+ADAPTIVE_THRESHOLD_DEFAULT = 80.0
+ADAPTIVE_INIT_RELAX = 4.0
 
-LEARNING_RATE = 0.08
+DISPUTE_COST_DEFAULT = 0.20
+REVIEW_COST_DEFAULT = 0.07
+LEARNING_RATE = 0.22
 TYPE1_WEIGHT = 2.0
-TYPE2_WEIGHT = 0.50
-MIN_FEEDBACK_N = 30
-DISPUTE_RATE = 0.15
+TYPE2_WEIGHT = 0.35
+MIN_FEEDBACK_N = 6
+DISPUTE_RATE = 0.35
 BATCH_SIZE_PER_CAMERA = 80
 RELAXATION_DAMPING = 0.35
+UPDATE_BATCHES_PER_CLICK = 1
+DEMO_PRECOMPUTED_MAX_STEP = 10
+REVIEW_TARGET = 0.10
+OBJECTIVE_REVIEW_WEIGHT = 0.20
+REVIEW_LIFT_CAP_RATE = 0.02
+DEMO_MIN_AUTO_CLEAR_RATE = 0.68
+DEMO_AUTO_CLEAR_SHORTFALL_COST = 0.90
+DEMO_RESULTS_STEP = 23
+
+TARGET_REVIEW_RATE = 0.10
+SCORE_WEIGHTS = {"lpn": 0.50, "lpj": 0.35, "lpt": 0.15}
+FIELD_SCORE_MEANS = {"lpn": 91.0, "lpj": 86.0, "lpt": 50.0}
+FIELD_SCORE_VAR = 5.0
+FIELD_SCORE_STD = float(np.sqrt(FIELD_SCORE_VAR))
+CAMERA_SCORE_SHIFT = {1: 1.0, 2: 0.0, 3: -1.0}
+CAMERA_ACCURACY_BIAS = {1: 0.08, 2: 0.00, 3: -0.14}
+FIELD_ACCURACY_BIAS = {"lpn": 0.05, "lpj": 0.02, "lpt": -0.10}
 
 FIELDS = ("lpn", "lpj", "lpt")
 FIELD_LABELS = {"lpn": "LPN", "lpj": "LPJ", "lpt": "LPT"}
@@ -59,6 +80,57 @@ PAL_GREEN = "#10b981"
 PAL_SLATE = "#64748b"
 PAL_BG = "rgba(255,255,255,0.65)"
 PAL_GRID = "#dbe4ec"
+DEMO_DEGRADATION_CAMERA = "CAM-1"
+DEMO_DEGRADATION_FIELD = "lpn"
+DEMO_DEGRADATION_MIN_SCORE = 88.0
+DEMO_HEALTH_SCORE_MAP = {
+    ("CAM-1", "lpj"): 18.0,
+    ("CAM-1", "lpn"): 92.0,
+    ("CAM-1", "lpt"): 24.0,
+    ("CAM-2", "lpj"): 34.0,
+    ("CAM-2", "lpn"): 20.0,
+    ("CAM-2", "lpt"): 48.0,
+    ("CAM-3", "lpj"): 44.0,
+    ("CAM-3", "lpn"): 52.0,
+    ("CAM-3", "lpt"): 46.0,
+}
+DEGRADATION_START_STEP = 3
+SHOCK_DROP_TRIGGER = 2.5
+SHOCK_COST_MULTIPLIER = 2.0
+DEMO_SHOCK_MIN_UPLIFT = 1.5
+DEMO_SHOCK_MIN_RELAX = 4.0
+DEMO_SHOCK_RECOVERY_STEPS = 4
+SHOCK_SCHEDULE = [
+    {
+        "lane_id": 3,
+        "field": "lpt",
+        "start": 1,
+        "end": 6,
+        "score_shift": -8.0,
+        "accuracy_shift": -0.16,
+        "label": "CAM-3 LPT degradation",
+    },
+    {
+        "lane_id": 2,
+        "field": "lpj",
+        "start": 5,
+        "end": 9,
+        "score_shift": -4.0,
+        "accuracy_shift": -0.08,
+        "label": "CAM-2 LPJ lighting shock",
+    },
+    {
+        "lane_id": 1,
+        "field": "lpn",
+        "start": 4,
+        "end": 8,
+        "display_start": 3,
+        "display_end": 8,
+        "score_shift": -10.0,
+        "accuracy_shift": -0.20,
+        "label": "CAM-1 LPN image quality degradation",
+    },
+]
 
 
 def pct(value: float) -> str:
@@ -103,21 +175,188 @@ def build_event_truth(rng: np.random.Generator) -> dict[str, str]:
     }
 
 
+def field_degradation_adjustment(lane_id: int, field: str, step: int) -> tuple[float, float]:
+    score_shift = 0.0
+    accuracy_shift = 0.0
+    for shock in SHOCK_SCHEDULE:
+        if shock["lane_id"] != lane_id or shock["field"] != field:
+            continue
+        if shock["start"] <= step <= shock["end"]:
+            score_shift += float(shock["score_shift"])
+            accuracy_shift += float(shock["accuracy_shift"])
+    return score_shift, accuracy_shift
+
+
+def shocks_for_lane(lane_id: int) -> list[dict]:
+    return [shock for shock in SHOCK_SCHEDULE if shock["lane_id"] == lane_id]
+
+
+def scheduled_shock_active(lane_key_value: str, field: str, step: int) -> bool:
+    lane_id = int(lane_key_value.replace("cam_", ""))
+    for shock in SHOCK_SCHEDULE:
+        if shock["lane_id"] == lane_id and shock["field"] == field and shock["start"] <= step <= shock["end"]:
+            return True
+    return False
+
+
+def scheduled_shock_start(lane_key_value: str, field: str) -> int | None:
+    lane_id = int(lane_key_value.replace("cam_", ""))
+    for shock in SHOCK_SCHEDULE:
+        if shock["lane_id"] == lane_id and shock["field"] == field:
+            return int(shock["start"])
+    return None
+
+
+def scheduled_shock_end(lane_key_value: str, field: str) -> int | None:
+    lane_id = int(lane_key_value.replace("cam_", ""))
+    for shock in SHOCK_SCHEDULE:
+        if shock["lane_id"] == lane_id and shock["field"] == field:
+            return int(shock["end"])
+    return None
+
+
+def generate_field_scores_normal(rng: np.random.Generator, lane_id: int, step: int) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for field in FIELDS:
+        score_shift, _ = field_degradation_adjustment(lane_id, field, step)
+        score = rng.normal(FIELD_SCORE_MEANS[field], FIELD_SCORE_STD) + CAMERA_SCORE_SHIFT[lane_id] + score_shift
+        scores[field] = float(np.clip(score, 1.0, 99.0))
+    return scores
+
+
+def compute_weighted_score(event: dict) -> float:
+    return float(
+        SCORE_WEIGHTS["lpn"] * event["LPN_score"]
+        + SCORE_WEIGHTS["lpj"] * event["LPJ_score"]
+        + SCORE_WEIGHTS["lpt"] * event["LPT_score"]
+    )
+
+
+def calibrate_weighted_baseline_threshold(events: list[dict], target_review_rate: float = TARGET_REVIEW_RATE) -> float:
+    weighted_scores = np.array([e["weighted_score"] for e in events], dtype=float)
+    quantile = float(np.quantile(weighted_scores, target_review_rate))
+    # Use whole-point cutoff for demo readability (round down).
+    return clip_threshold(float(np.floor(quantile)))
+
+
+def calibrate_or_baseline_threshold(events: list[dict], target_review_rate: float = TARGET_REVIEW_RATE) -> float:
+    grid = np.arange(1.0, 95.5, 0.5)
+    best_tau = 80.0
+    best_gap = float("inf")
+    for tau in grid:
+        thresholds = thresholds_from_shared(float(tau))
+        counts = compute_outcome_counts(events, thresholds)
+        review_rate = counts["review"] / max(1, len(events))
+        gap = abs(review_rate - target_review_rate)
+        if gap < best_gap:
+            best_gap = gap
+            best_tau = float(tau)
+    return clip_threshold(best_tau)
+
+
+def calibrate_initial_or_thresholds(events: list[dict], target_review_rate: float = TARGET_REVIEW_RATE) -> dict[str, dict[str, float]]:
+    """
+    Build per-camera, per-field starting thresholds for OR-gate routing.
+    We set each field to the same fail-quantile target so thresholds differ by field distribution.
+    """
+    # If three independent field checks each fail at r, OR review rate is 1-(1-r)^3.
+    field_fail_target = 1.0 - (1.0 - target_review_rate) ** (1.0 / 3.0)
+    out: dict[str, dict[str, float]] = {}
+    for lane in LANES:
+        key = lane_key(lane["lane_id"])
+        out[key] = {}
+        lane_events = [e for e in events if lane_key(e["lane_id"]) == key]
+        for field in FIELDS:
+            vals = np.array([e[f"{FIELD_LABELS[field]}_score"] for e in lane_events], dtype=float)
+            out[key][field] = clip_threshold(float(np.quantile(vals, field_fail_target)) - ADAPTIVE_INIT_RELAX)
+    return out
+
+
+def route_event_weighted(event: dict, tau_camera_weighted: float) -> str:
+    return "review" if event["weighted_score"] < tau_camera_weighted else "auto_clear"
+
+
+def route_event_with_3field_thresholds(event: dict, thresholds_camera: dict[str, float]) -> tuple[str, list[str]]:
+    gate_fields: list[str] = []
+    for field in FIELDS:
+        if event[f"{FIELD_LABELS[field]}_score"] < thresholds_camera[field]:
+            gate_fields.append(field)
+    return ("review" if gate_fields else "auto_clear"), gate_fields
+
+
+def thresholds_from_shared(shared: float) -> dict[str, dict[str, float]]:
+    tau = clip_threshold(shared)
+    return {lane_key(l["lane_id"]): {field: tau for field in FIELDS} for l in LANES}
+
+
+def thresholds_from_shared_weighted(shared: float) -> dict[str, float]:
+    tau = clip_threshold(shared)
+    return {lane_key(l["lane_id"]): tau for l in LANES}
+
+
+def generate_tolling_events_3field(
+    step: int,
+    n_per_camera: int = BATCH_SIZE_PER_CAMERA,
+) -> list[dict]:
+    events: list[dict] = []
+    for lane in LANES:
+        lane_id = lane["lane_id"]
+        rng = np.random.default_rng(1000 + lane_id * 211 + step * 97)
+        for i in range(n_per_camera):
+            truth = build_event_truth(rng)
+            score_map = generate_field_scores_normal(rng, lane_id, step)
+            ocr_map: dict[str, str] = {}
+            field_correct: dict[str, bool] = {}
+
+            for field in FIELDS:
+                score = score_map[field]
+                _, acc_shift = field_degradation_adjustment(lane_id, field, step)
+                p_correct = np.clip(
+                    0.35 + 0.006 * score + CAMERA_ACCURACY_BIAS[lane_id] + FIELD_ACCURACY_BIAS[field] + acc_shift,
+                    0.05,
+                    0.995,
+                )
+                is_correct = bool(rng.random() < p_correct)
+                field_correct[field] = is_correct
+                ocr_map[field] = truth[field] if is_correct else random_ocr_miss(truth[field], field, rng)
+
+            event = {
+                "event_id": f"s{step}-c{lane_id}-{i}",
+                "camera_id": lane["camera"],
+                "lane_id": lane_id,
+                "LPN": truth["lpn"],
+                "LPJ": truth["lpj"],
+                "LPT": truth["lpt"],
+                "LPN_OCRval": ocr_map["lpn"],
+                "LPJ_OCRval": ocr_map["lpj"],
+                "LPT_OCRval": ocr_map["lpt"],
+                "LPN_score": score_map["lpn"],
+                "LPJ_score": score_map["lpj"],
+                "LPT_score": score_map["lpt"],
+                "field_correct": field_correct,
+            }
+            event["weighted_score"] = compute_weighted_score(event)
+            events.append(event)
+    return events
+
+
 def initial_threshold_store_3field() -> dict:
-    current = {
-        # Start from the same shared 80 baseline used in the exported CSV.
-        lane_key(l["lane_id"]): {field: 0.80 for field in FIELDS}
-        for l in LANES
-    }
+    calibration_events = generate_tolling_events_3field(step=0, n_per_camera=1200)
+    baseline_tau_weighted = calibrate_weighted_baseline_threshold(calibration_events, TARGET_REVIEW_RATE)
+    current = calibrate_initial_or_thresholds(calibration_events, TARGET_REVIEW_RATE)
     history = {
         lane_key(l["lane_id"]): {field: [current[lane_key(l["lane_id"])][field]] for field in FIELDS}
         for l in LANES
     }
-    last_delta = {
-        lane_key(l["lane_id"]): {field: 0.0 for field in FIELDS}
-        for l in LANES
+    last_delta = {lane_key(l["lane_id"]): {field: 0.0 for field in FIELDS} for l in LANES}
+    baseline_tau_or = float(np.mean([current[lane_key(l["lane_id"])][field] for l in LANES for field in FIELDS]))
+    return {
+        "current": current,
+        "history": history,
+        "last_delta": last_delta,
+        "baseline_tau_or": baseline_tau_or,
+        "baseline_tau_weighted": baseline_tau_weighted,
     }
-    return {"current": current, "history": history, "last_delta": last_delta}
 
 
 def initial_feedback_store_3field() -> dict:
@@ -130,100 +369,52 @@ def initial_feedback_store_3field() -> dict:
             "dispute": 0.0,
             "auto_clear": 0.0,
             "routed_review": 0.0,
+            "labeled": 0.0,
         }
         for l in LANES
     }
     per_camera_field = {
-        lane_key(l["lane_id"]): {
-            field: {"labeled": 0.0, "type1": 0.0, "type2": 0.0}
-            for field in FIELDS
-        }
+        lane_key(l["lane_id"]): {field: {"labeled": 0.0, "type1": 0.0, "type2": 0.0} for field in FIELDS}
         for l in LANES
     }
     return {
         "per_camera": per_camera,
         "per_camera_field": per_camera_field,
+        "prev_score_means": {
+            lane_key(l["lane_id"]): {field: None for field in FIELDS}
+            for l in LANES
+        },
         "last_batch_events": [],
         "last_batch_counts": {"auto_clear": 0, "review": 0, "type1": 0, "type2": 0},
+        "time_history": {
+            "step": [],
+            "adaptive_type1": [],
+            "adaptive_review": [],
+            "adaptive_cost": [],
+            "baseline_type1": [],
+            "baseline_review": [],
+            "baseline_cost": [],
+        },
     }
-
-
-def generate_tolling_events_3field(
-    step: int,
-    n_per_camera: int = BATCH_SIZE_PER_CAMERA,
-) -> list[dict]:
-    events: list[dict] = []
-    for lane in LANES:
-        lane_id = lane["lane_id"]
-        rng = np.random.default_rng(1000 + lane_id * 211 + step * 97)
-        # Simulate slight camera degradation drift over time for weaker cameras.
-        drift = -0.015 * max(0, step - 4) if lane_id == 3 else 0.0
-
-        for i in range(n_per_camera):
-            truth = build_event_truth(rng)
-            conf_map: dict[str, float] = {}
-            ocr_map: dict[str, str] = {}
-            for field in FIELDS:
-                base = rng.beta(5, 2)
-                conf = float(np.clip(base + LANE_CONF_SHIFT[lane_id] + FIELD_OFFSET[field] + drift + rng.normal(0, 0.02), 0.02, 0.99))
-                conf_map[field] = conf
-                is_correct = bool(rng.random() < conf)
-                ocr_map[field] = truth[field] if is_correct else random_ocr_miss(truth[field], field, rng)
-
-            events.append(
-                {
-                    "event_id": f"s{step}-c{lane_id}-{i}",
-                    "camera_id": lane["camera"],
-                    "lane_id": lane_id,
-                    "LPN": truth["lpn"],
-                    "LPJ": truth["lpj"],
-                    "LPT": truth["lpt"],
-                    "LPN_OCRval": ocr_map["lpn"],
-                    "LPJ_OCRval": ocr_map["lpj"],
-                    "LPT_OCRval": ocr_map["lpt"],
-                    "LPN_conf": conf_map["lpn"],
-                    "LPJ_conf": conf_map["lpj"],
-                    "LPT_conf": conf_map["lpt"],
-                }
-            )
-    return events
-
-
-def route_event_with_3field_thresholds(event: dict, thresholds_camera: dict[str, float]) -> tuple[str, list[str]]:
-    gate_fields = []
-    for field in FIELDS:
-        if event[f"{FIELD_LABELS[field]}_conf"] < thresholds_camera[field]:
-            gate_fields.append(field)
-    decision = "review" if gate_fields else "auto_clear"
-    return decision, gate_fields
 
 
 def label_event_error_type(event: dict, decision: str, gate_fields: list[str], rng: np.random.Generator) -> tuple[str | None, str, bool]:
-    field_correct = {
-        "lpn": event["LPN"] == event["LPN_OCRval"],
-        "lpj": event["LPJ"] == event["LPJ_OCRval"],
-        "lpt": event["LPT"] == event["LPT_OCRval"],
-    }
-    overall_correct = all(field_correct.values())
+    overall_correct = bool(event["field_correct"]["lpn"] and event["field_correct"]["lpj"] and event["field_correct"]["lpt"])
     feedback_source = "none"
     error_label: str | None = None
 
     if decision == "review":
         feedback_source = "review"
-        if overall_correct:
-            error_label = "type2"  # false negative: sent to review but correct
-        else:
-            error_label = "correct"
+        error_label = "type2" if overall_correct else "correct"
     else:
-        if not overall_correct and rng.random() < DISPUTE_RATE:
+        if (not overall_correct) and rng.random() < DISPUTE_RATE:
             feedback_source = "dispute"
-            error_label = "type1"  # false positive: auto-cleared but wrong
+            error_label = "type1"
 
     event["decision"] = decision
     event["gate_fields"] = gate_fields
     event["feedback_source"] = feedback_source
     event["error_label"] = error_label
-    event["field_correct"] = field_correct
     event["overall_correct"] = overall_correct
     return error_label, feedback_source, overall_correct
 
@@ -238,17 +429,14 @@ def aggregate_feedback_3field(events: list[dict]) -> tuple[dict, dict, dict]:
             "dispute": 0.0,
             "auto_clear": 0.0,
             "routed_review": 0.0,
+            "labeled": 0.0,
         }
         for l in LANES
     }
     per_camera_field = {
-        lane_key(l["lane_id"]): {
-            field: {"labeled": 0.0, "type1": 0.0, "type2": 0.0}
-            for field in FIELDS
-        }
+        lane_key(l["lane_id"]): {field: {"labeled": 0.0, "type1": 0.0, "type2": 0.0} for field in FIELDS}
         for l in LANES
     }
-
     batch_counts = {"auto_clear": 0, "review": 0, "type1": 0, "type2": 0}
 
     for event in events:
@@ -261,44 +449,216 @@ def aggregate_feedback_3field(events: list[dict]) -> tuple[dict, dict, dict]:
             cam["auto_clear"] += 1
             batch_counts["auto_clear"] += 1
 
-        source = event["feedback_source"]
-        if source == "review":
+        if event["feedback_source"] == "review":
             cam["review"] += 1
-        elif source == "dispute":
+        elif event["feedback_source"] == "dispute":
             cam["dispute"] += 1
 
         label = event["error_label"]
         if label is None:
             continue
+
+        cam["labeled"] += 1
         if label == "type1":
             cam["type1"] += 1
             batch_counts["type1"] += 1
-        elif label == "type2":
-            cam["type2"] += 1
-            batch_counts["type2"] += 1
-        else:
-            cam["correct"] += 1
-
-        # Field-level pressure for updates.
-        # Type I pressure: auto-cleared and field incorrect.
-        if label == "type1":
             for field in FIELDS:
                 if not event["field_correct"][field]:
                     rec = per_camera_field[key][field]
                     rec["labeled"] += 1.0
                     rec["type1"] += 1.0
-        # Type II pressure: reviewed, overall correct, and field was a gate trigger.
         elif label == "type2":
-            for field in event["gate_fields"]:
+            cam["type2"] += 1
+            batch_counts["type2"] += 1
+            for field in event.get("gate_fields", []):
                 rec = per_camera_field[key][field]
                 rec["labeled"] += 1.0
                 rec["type2"] += 1.0
         else:
-            for field in event["gate_fields"]:
-                rec = per_camera_field[key][field]
-                rec["labeled"] += 1.0
+            cam["correct"] += 1
 
     return per_camera, per_camera_field, batch_counts
+
+
+def update_thresholds_3field(
+    thresholds: dict[str, dict[str, float]],
+    events: list[dict],
+    sim_step: int,
+    dispute_cost: float = DISPUTE_COST_DEFAULT,
+    review_cost: float = REVIEW_COST_DEFAULT,
+    prev_score_means: dict[str, dict[str, float | None]] | None = None,
+) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
+    updated = deepcopy(thresholds)
+    deltas = {cam: {field: 0.0 for field in FIELDS} for cam in thresholds}
+    events_by_cam = {lane_key(l["lane_id"]): [e for e in events if lane_key(e["lane_id"]) == lane_key(l["lane_id"])] for l in LANES}
+
+    for cam, cam_events in events_by_cam.items():
+        if not cam_events:
+            continue
+        for field in FIELDS:
+            current_tau = float(updated[cam][field])
+            shock_start = scheduled_shock_start(cam, field)
+            shock_end = scheduled_shock_end(cam, field)
+            if shock_start is not None and sim_step < shock_start:
+                updated[cam][field] = current_tau
+                deltas[cam][field] = 0.0
+                continue
+            observed_scores = [float(e[f"{FIELD_LABELS[field]}_score"]) for e in cam_events]
+            current_mean = float(np.mean(observed_scores)) if observed_scores else current_tau
+            prev_mean = None if prev_score_means is None else prev_score_means.get(cam, {}).get(field)
+            shock_active = scheduled_shock_active(cam, field, sim_step) or (
+                prev_mean is not None and (prev_mean - current_mean) >= SHOCK_DROP_TRIGGER
+            )
+            effective_dispute_cost = dispute_cost * (SHOCK_COST_MULTIPLIER if shock_active else 1.0)
+            candidates = sorted(
+                {
+                    clip_threshold(round(v * 2.0) / 2.0)
+                    for v in observed_scores + [current_tau, current_tau + 1.0, current_tau + 2.0, current_tau + 3.0, current_tau + 4.0]
+                }
+            )
+            best_tau = current_tau
+            best_counts = compute_camera_counts(cam_events, updated[cam])
+            best_cost = policy_objective(best_counts, dispute_cost=effective_dispute_cost, review_cost=review_cost)
+            best_meets_majority = (best_counts["auto_clear"] / max(1, len(cam_events))) >= DEMO_MIN_AUTO_CLEAR_RATE
+
+            for candidate_tau in candidates:
+                trial_thresholds = dict(updated[cam])
+                trial_thresholds[field] = float(candidate_tau)
+                counts = compute_camera_counts(cam_events, trial_thresholds)
+                cost = policy_objective(counts, dispute_cost=effective_dispute_cost, review_cost=review_cost)
+                meets_majority = (counts["auto_clear"] / max(1, len(cam_events))) >= DEMO_MIN_AUTO_CLEAR_RATE
+                if (
+                    (meets_majority and not best_meets_majority)
+                    or (
+                        meets_majority == best_meets_majority
+                        and cost < best_cost - 1e-9
+                    )
+                    or (
+                        meets_majority == best_meets_majority
+                        and abs(cost - best_cost) <= 1e-9
+                        and counts["type1"] < best_counts["type1"]
+                    )
+                    or (
+                        meets_majority == best_meets_majority
+                        and abs(cost - best_cost) <= 1e-9
+                        and counts["type1"] == best_counts["type1"]
+                        and counts["review"] < best_counts["review"]
+                    )
+                ):
+                    best_tau = float(candidate_tau)
+                    best_counts = counts
+                    best_cost = cost
+                    best_meets_majority = meets_majority
+
+            if shock_active:
+                best_tau = clip_threshold(max(best_tau, current_tau + DEMO_SHOCK_MIN_UPLIFT))
+            elif shock_end is not None and shock_end < sim_step <= (shock_end + DEMO_SHOCK_RECOVERY_STEPS):
+                best_tau = clip_threshold(min(best_tau, current_tau - DEMO_SHOCK_MIN_RELAX))
+
+            updated[cam][field] = best_tau
+            deltas[cam][field] = float(best_tau - current_tau)
+
+    return updated, deltas
+
+
+def compute_results_kpis(
+    shared_threshold: float,
+    current_thresholds: dict[str, dict[str, float]],
+    sim_step: int,
+    dispute_cost: float,
+    review_cost: float,
+) -> dict[str, float | str]:
+    baseline, adaptive, n_events = get_cached_results_counts(shared_threshold, current_thresholds, sim_step)
+    n = max(1, n_events)
+
+    type1_delta = adaptive["type1"] - baseline["type1"]
+    review_lift_rate = (adaptive["review"] - baseline["review"]) / n
+    review_lift_count = adaptive["review"] - baseline["review"]
+    type1_delta_rate = type1_delta / max(1, baseline["type1"])
+    objective_delta = policy_objective(adaptive, dispute_cost=dispute_cost, review_cost=review_cost) - policy_objective(
+        baseline, dispute_cost=dispute_cost, review_cost=review_cost
+    )
+
+    return {
+        "baseline_type1": float(baseline["type1"]),
+        "adaptive_type1": float(adaptive["type1"]),
+        "type1_delta": float(type1_delta),
+        "type1_delta_rate": float(type1_delta_rate),
+        "review_lift_rate": float(review_lift_rate),
+        "review_lift_count": float(review_lift_count),
+        "objective_delta": float(objective_delta),
+    }
+
+
+def results_eval_step(sim_step: int) -> int:
+    # Compare policies in a fixed, late degraded operating regime where the adaptive policy has had time to respond.
+    return max(DEMO_RESULTS_STEP, int(sim_step or 0))
+
+
+def compute_outcome_counts_shared_or(events: list[dict], shared_tau: float) -> dict[str, int]:
+    return compute_outcome_counts(events, thresholds_from_shared(shared_tau))
+
+
+def threshold_cache_key(current_thresholds: dict[str, dict[str, float]]) -> tuple[tuple[str, tuple[tuple[str, float], ...]], ...]:
+    return tuple(
+        (cam_key, tuple((field, float(current_thresholds[cam_key][field])) for field in FIELDS))
+        for cam_key in sorted(current_thresholds)
+    )
+
+
+@lru_cache(maxsize=128)
+def cached_results_counts(
+    shared_threshold: float,
+    thresholds_key: tuple[tuple[str, tuple[tuple[str, float], ...]], ...],
+    eval_step: int,
+) -> tuple[dict[str, int], dict[str, int], int]:
+    events = generate_tolling_events_3field(step=eval_step, n_per_camera=1200)
+    current_thresholds = {
+        cam_key: {field: value for field, value in field_pairs}
+        for cam_key, field_pairs in thresholds_key
+    }
+    baseline = compute_outcome_counts_weighted(events, thresholds_from_shared_weighted(shared_threshold))
+    adaptive = compute_outcome_counts(events, current_thresholds)
+    return baseline, adaptive, len(events)
+
+
+def get_cached_results_counts(
+    shared_threshold: float,
+    current_thresholds: dict[str, dict[str, float]],
+    sim_step: int,
+) -> tuple[dict[str, int], dict[str, int], int]:
+    return cached_results_counts(
+        float(shared_threshold),
+        threshold_cache_key(current_thresholds),
+        results_eval_step(sim_step),
+    )
+
+
+def policy_objective(counts: dict[str, int], dispute_cost: float = DISPUTE_COST_DEFAULT, review_cost: float = REVIEW_COST_DEFAULT) -> float:
+    total = max(1, counts["auto_clear"] + counts["review"])
+    required_auto = DEMO_MIN_AUTO_CLEAR_RATE * total
+    shortfall = max(0.0, required_auto - counts["auto_clear"])
+    return float(
+        dispute_cost * counts["type1"]
+        + review_cost * counts["review"]
+        + DEMO_AUTO_CLEAR_SHORTFALL_COST * shortfall
+    )
+
+
+def compute_camera_counts(events: list[dict], thresholds_camera: dict[str, float]) -> dict[str, int]:
+    counts = {"auto_clear": 0, "review": 0, "type1": 0, "type2": 0}
+    for event in events:
+        decision, _ = route_event_with_3field_thresholds(event, thresholds_camera)
+        is_correct = bool(event["field_correct"]["lpn"] and event["field_correct"]["lpj"] and event["field_correct"]["lpt"])
+        if decision == "auto_clear":
+            counts["auto_clear"] += 1
+            if not is_correct:
+                counts["type1"] += 1
+        else:
+            counts["review"] += 1
+            if is_correct:
+                counts["type2"] += 1
+    return counts
 
 
 def simulate_batch_counts_for_policy(
@@ -306,10 +666,6 @@ def simulate_batch_counts_for_policy(
     thresholds: dict[str, dict[str, float]],
     seed: int = 0,
 ) -> dict[str, int]:
-    """
-    Run the routing + feedback labeling logic on a batch under a given threshold policy.
-    Returns policy-level counts for quick KPI comparison.
-    """
     rng = np.random.default_rng(991 + seed)
     counts = {"auto_clear": 0, "review": 0, "type1": 0, "type2": 0}
     for event in events:
@@ -328,15 +684,35 @@ def simulate_batch_counts_for_policy(
     return counts
 
 
+def simulate_batch_counts_for_weighted_policy(
+    events: list[dict],
+    thresholds: dict[str, float],
+    seed: int = 0,
+) -> dict[str, int]:
+    rng = np.random.default_rng(991 + seed)
+    counts = {"auto_clear": 0, "review": 0, "type1": 0, "type2": 0}
+    for event in events:
+        event_copy = dict(event)
+        cam_key = lane_key(event_copy["lane_id"])
+        decision = route_event_weighted(event_copy, thresholds[cam_key])
+        label, _source, _correct = label_event_error_type(event_copy, decision, [], rng)
+        if decision == "review":
+            counts["review"] += 1
+        else:
+            counts["auto_clear"] += 1
+        if label == "type1":
+            counts["type1"] += 1
+        elif label == "type2":
+            counts["type2"] += 1
+    return counts
+
+
 def compute_outcome_counts(events: list[dict], thresholds: dict[str, dict[str, float]]) -> dict[str, int]:
-    """
-    Policy outcome counts from ground truth (not sampled feedback labels).
-    """
     counts = {"auto_clear": 0, "review": 0, "type1": 0, "type2": 0}
     for event in events:
         cam_key = lane_key(event["lane_id"])
         decision, _ = route_event_with_3field_thresholds(event, thresholds[cam_key])
-        is_correct = (event["LPN"] == event["LPN_OCRval"]) and (event["LPJ"] == event["LPJ_OCRval"]) and (event["LPT"] == event["LPT_OCRval"])
+        is_correct = bool(event["field_correct"]["lpn"] and event["field_correct"]["lpj"] and event["field_correct"]["lpt"])
         if decision == "auto_clear":
             counts["auto_clear"] += 1
             if not is_correct:
@@ -348,39 +724,30 @@ def compute_outcome_counts(events: list[dict], thresholds: dict[str, dict[str, f
     return counts
 
 
-def update_thresholds_3field(
-    thresholds: dict[str, dict[str, float]],
-    per_camera_field: dict[str, dict[str, dict[str, float]]],
-) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
-    updated = deepcopy(thresholds)
-    deltas = {cam: {field: 0.0 for field in FIELDS} for cam in thresholds}
-    for cam, fields in per_camera_field.items():
-        for field, rec in fields.items():
-            labeled = rec["labeled"]
-            if labeled <= 0:
-                continue
-            type1_rate = rec["type1"] / labeled
-            type2_rate = rec["type2"] / labeled
-            eta = LEARNING_RATE if labeled >= MIN_FEEDBACK_N else LEARNING_RATE * 0.25
-            delta = eta * (TYPE1_WEIGHT * type1_rate - TYPE2_WEIGHT * type2_rate)
-            # Safety bias for demo stability:
-            # allow tightening quickly, but relax (lower tau) more slowly.
-            if delta < 0:
-                delta *= RELAXATION_DAMPING
-            updated[cam][field] = clip_threshold(updated[cam][field] + delta)
-            deltas[cam][field] = float(delta)
-    return updated, deltas
+def compute_outcome_counts_weighted(events: list[dict], thresholds: dict[str, float]) -> dict[str, int]:
+    counts = {"auto_clear": 0, "review": 0, "type1": 0, "type2": 0}
+    for event in events:
+        cam_key = lane_key(event["lane_id"])
+        decision = route_event_weighted(event, thresholds[cam_key])
+        is_correct = bool(event["field_correct"]["lpn"] and event["field_correct"]["lpj"] and event["field_correct"]["lpt"])
+        if decision == "auto_clear":
+            counts["auto_clear"] += 1
+            if not is_correct:
+                counts["type1"] += 1
+        else:
+            counts["review"] += 1
+            if is_correct:
+                counts["type2"] += 1
+    return counts
 
 
 def evaluate_policy(events: list[dict], thresholds: dict[str, dict[str, float]]) -> dict:
     tp = fp = fn = tn = 0
     per_camera = {lane_key(l["lane_id"]): {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for l in LANES}
-
     for event in events:
         key = lane_key(event["lane_id"])
         decision, _ = route_event_with_3field_thresholds(event, thresholds[key])
-        is_correct = (event["LPN"] == event["LPN_OCRval"]) and (event["LPJ"] == event["LPJ_OCRval"]) and (event["LPT"] == event["LPT_OCRval"])
-
+        is_correct = bool(event["field_correct"]["lpn"] and event["field_correct"]["lpj"] and event["field_correct"]["lpt"])
         target = per_camera[key]
         if decision == "auto_clear" and is_correct:
             tp += 1
@@ -410,7 +777,6 @@ def evaluate_policy(events: list[dict], thresholds: dict[str, dict[str, float]])
             "review_rate": (rec["fn"] + rec["tn"]) / ct if ct else 0.0,
             "bad_auto_rate": rec["fp"] / ct if ct else 0.0,
         }
-
     return {
         "overall": {"auto_rate": auto_rate, "review_rate": review_rate, "bad_auto_rate": bad_auto_rate, "utility": utility},
         "by_camera": by_camera,
@@ -418,13 +784,12 @@ def evaluate_policy(events: list[dict], thresholds: dict[str, dict[str, float]])
 
 
 def export_dataset_csv(path: Path = DEFAULT_DATASET_CSV, n_per_camera: int = 1200, step: int = 0) -> Path:
-    """
-    Export a deterministic synthetic multi-field OCR dataset to CSV.
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Main CSV mirrors current real-world-style baseline: fixed shared 80 cutoff.
-    thresholds = thresholds_from_shared(0.80)
     events = generate_tolling_events_3field(step=step, n_per_camera=n_per_camera)
+    baseline_tau_weighted = calibrate_weighted_baseline_threshold(events, TARGET_REVIEW_RATE)
+    baseline_tau_or = calibrate_or_baseline_threshold(events, TARGET_REVIEW_RATE)
+    baseline_thresholds_weighted = thresholds_from_shared_weighted(baseline_tau_weighted)
+    adaptive_thresholds = calibrate_initial_or_thresholds(events, TARGET_REVIEW_RATE)
     rng = np.random.default_rng(4040 + step)
 
     fieldnames = [
@@ -437,25 +802,29 @@ def export_dataset_csv(path: Path = DEFAULT_DATASET_CSV, n_per_camera: int = 120
         "LPN_OCRval",
         "LPJ_OCRval",
         "LPT_OCRval",
-        "LPN_conf",
-        "LPJ_conf",
-        "LPT_conf",
+        "LPN_score",
+        "LPJ_score",
+        "LPT_score",
+        "weighted_score",
+        "baseline_tau_weighted",
+        "baseline_tau_or",
         "LPN_thresh",
         "LPJ_thresh",
         "LPT_thresh",
-        "decision",
+        "decision_weighted_baseline",
+        "decision_or_adaptive",
         "feedback_source",
         "error_label",
         "overall_correct",
     ]
-
     with path.open("w", newline="", encoding="utf-8") as fp:
         writer = csv.DictWriter(fp, fieldnames=fieldnames)
         writer.writeheader()
         for event in events:
             cam_key = lane_key(event["lane_id"])
-            decision, gate_fields = route_event_with_3field_thresholds(event, thresholds[cam_key])
-            label_event_error_type(event, decision, gate_fields, rng)
+            decision_baseline = route_event_weighted(event, baseline_thresholds_weighted[cam_key])
+            decision_adaptive, gate_fields_adaptive = route_event_with_3field_thresholds(event, adaptive_thresholds[cam_key])
+            label_event_error_type(event, decision_adaptive, gate_fields_adaptive, rng)
             writer.writerow(
                 {
                     "event_id": event["event_id"],
@@ -467,26 +836,23 @@ def export_dataset_csv(path: Path = DEFAULT_DATASET_CSV, n_per_camera: int = 120
                     "LPN_OCRval": event["LPN_OCRval"],
                     "LPJ_OCRval": event["LPJ_OCRval"],
                     "LPT_OCRval": event["LPT_OCRval"],
-                    "LPN_conf": f"{event['LPN_conf']:.6f}",
-                    "LPJ_conf": f"{event['LPJ_conf']:.6f}",
-                    "LPT_conf": f"{event['LPT_conf']:.6f}",
-                    "LPN_thresh": f"{thresholds[cam_key]['lpn']:.6f}",
-                    "LPJ_thresh": f"{thresholds[cam_key]['lpj']:.6f}",
-                    "LPT_thresh": f"{thresholds[cam_key]['lpt']:.6f}",
-                    "decision": event["decision"],
+                    "LPN_score": f"{event['LPN_score']:.3f}",
+                    "LPJ_score": f"{event['LPJ_score']:.3f}",
+                    "LPT_score": f"{event['LPT_score']:.3f}",
+                    "weighted_score": f"{event['weighted_score']:.3f}",
+                    "baseline_tau_weighted": f"{baseline_tau_weighted:.3f}",
+                    "baseline_tau_or": f"{baseline_tau_or:.3f}",
+                    "LPN_thresh": f"{adaptive_thresholds[cam_key]['lpn']:.3f}",
+                    "LPJ_thresh": f"{adaptive_thresholds[cam_key]['lpj']:.3f}",
+                    "LPT_thresh": f"{adaptive_thresholds[cam_key]['lpt']:.3f}",
+                    "decision_weighted_baseline": decision_baseline,
+                    "decision_or_adaptive": decision_adaptive,
                     "feedback_source": event["feedback_source"],
                     "error_label": event["error_label"] or "",
                     "overall_correct": int(event["overall_correct"]),
                 }
             )
     return path
-
-
-def thresholds_from_shared(shared: float) -> dict[str, dict[str, float]]:
-    return {
-        lane_key(l["lane_id"]): {field: clip_threshold(shared) for field in FIELDS}
-        for l in LANES
-    }
 
 
 def graph_card(graph_id: str) -> html.Div:
@@ -496,28 +862,28 @@ def graph_card(graph_id: str) -> html.Div:
 def make_score_meaning_block() -> html.Div:
     sample = {
         "plate": "MD 7BK2391",
-        "lpn_score": 84,
-        "lpj_score": 79,
-        "lpt_score": 74,
-        "lpn_thresh": 80,
-        "lpj_thresh": 80,
-        "lpt_thresh": 80,
+        "lpn_score": 91,
+        "lpj_score": 86,
+        "lpt_score": 50,
+        "lpn_tau": 81.0,
+        "lpj_tau": 81.0,
+        "lpt_tau": 81.0,
     }
-    checks = [
-        ("LPJ", sample["lpj_score"], sample["lpj_thresh"]),
-        ("LPN", sample["lpn_score"], sample["lpn_thresh"]),
-        ("LPT", sample["lpt_score"], sample["lpt_thresh"]),
-    ]
     check_rows = []
-    for label, score, thresh in checks:
-        passed = score >= thresh
+    checks = [
+        ("LPJ", sample["lpj_score"], sample["lpj_tau"]),
+        ("LPN", sample["lpn_score"], sample["lpn_tau"]),
+        ("LPT", sample["lpt_score"], sample["lpt_tau"]),
+    ]
+    for label, score, tau in checks:
+        passed = score >= tau
         check_rows.append(
             html.Div(
                 className=f"score-check-row field-{label.lower()}",
                 children=[
                     html.Div(label, className="score-check-label"),
                     html.Div(f"confidence score: {score}", className="score-check-value"),
-                    html.Div(f"threshold {thresh}", className="score-check-thresh"),
+                    html.Div(f"threshold {tau:.0f}", className="score-check-thresh"),
                     html.Div("PASS" if passed else "REVIEW", className=f"score-check-status {'pass' if passed else 'review'}"),
                 ],
             )
@@ -529,7 +895,7 @@ def make_score_meaning_block() -> html.Div:
             html.H6("Step 1: What the OCR score means", className="mb-2"),
             html.P(
                 "Each plate read returns three model scores: number (LPN), jurisdiction (LPJ), and type (LPT). "
-                "Each score is compared against its threshold for routing.",
+                "Each score is checked against its own threshold.",
                 className="text-secondary mb-2",
             ),
             html.Div(
@@ -552,25 +918,26 @@ def make_score_meaning_block() -> html.Div:
             ),
             html.Div(check_rows),
             html.Div(
-                "Routing rule: if any one check fails, the whole event is routed to review.",
+                "Routing rule: if any one field fails threshold, the full event is sent to review.",
                 className="text-secondary small mt-2 mb-0",
             ),
         ],
     )
 
 
-def make_arbitrary_cutoff_figure(shared_threshold: float, canonical_cutoff: int = 80) -> go.Figure:
+def make_arbitrary_cutoff_figure(shared_threshold: float) -> go.Figure:
     """
     Explain cutoff semantics with a score ruler:
     one cutoff line splits the same reads into two routing zones.
     """
     rng = np.random.default_rng(902)
-    conf = np.clip(rng.beta(5, 2, size=120), 0.02, 0.99)
-    scores = np.round(conf * 99).astype(int)
-    cutoff = canonical_cutoff
+    scores = np.clip(rng.normal(83.1, np.sqrt(1.975), size=120), 45, 99).round(1)
+    cutoff = float(shared_threshold)
+    x_min = max(1.0, cutoff - 6.0)
+    x_max = min(99.0, cutoff + 6.0)
     y = rng.normal(0.0, 0.065, size=len(scores))
     # Simulated truth for explanation: high score can still occasionally be wrong.
-    correct_flags = rng.random(len(conf)) < conf
+    correct_flags = rng.random(len(scores)) < np.clip(0.30 + 0.007 * scores, 0.05, 0.995)
     review_mask = scores < cutoff
     auto_mask = ~review_mask
     wrong_auto_mask = auto_mask & (~correct_flags)
@@ -581,8 +948,8 @@ def make_arbitrary_cutoff_figure(shared_threshold: float, canonical_cutoff: int 
     auto_rate = auto_n / total_n
 
     fig = go.Figure()
-    fig.add_vrect(x0=45, x1=cutoff, fillcolor="rgba(245,158,11,0.20)", line_width=0, layer="below")
-    fig.add_vrect(x0=cutoff, x1=99, fillcolor="rgba(22,163,74,0.08)", line_width=0, layer="below")
+    fig.add_vrect(x0=x_min, x1=cutoff, fillcolor="rgba(245,158,11,0.20)", line_width=0, layer="below")
+    fig.add_vrect(x0=cutoff, x1=x_max, fillcolor="rgba(22,163,74,0.08)", line_width=0, layer="below")
     fig.add_trace(
         go.Scatter(
             x=scores[review_mask],
@@ -624,7 +991,7 @@ def make_arbitrary_cutoff_figure(shared_threshold: float, canonical_cutoff: int 
         fig.add_annotation(
             x=x_bad,
             y=y_bad,
-            ax=min(x_bad + 8, 96),
+            ax=max(x_min + 0.8, min(x_bad + 3.5, x_max - 0.8)),
             ay=0.18,
             xref="x",
             yref="y",
@@ -644,9 +1011,11 @@ def make_arbitrary_cutoff_figure(shared_threshold: float, canonical_cutoff: int 
             align="left",
         )
     fig.add_vline(x=cutoff, line_color="rgba(51,65,85,0.45)", line_width=2.0, line_dash="dash")
-    fig.add_annotation(x=cutoff, y=0.24, text=f"Cutoff = {cutoff}", showarrow=False, font=dict(size=11, color="#334155"))
-    fig.add_annotation(x=61, y=0.24, text=f"Review zone: {review_n} reads ({pct(review_rate)})", showarrow=False, font=dict(size=10, color="#b45309"))
-    fig.add_annotation(x=89, y=0.24, text=f"Auto zone: {auto_n} reads ({pct(auto_rate)})", showarrow=False, font=dict(size=10, color="#047857"))
+    fig.add_annotation(x=cutoff, y=0.24, text=f"Cutoff = {cutoff:.1f}", showarrow=False, font=dict(size=11, color="#334155"))
+    left_label_x = x_min + 0.5 * (cutoff - x_min)
+    right_label_x = cutoff + 0.5 * (x_max - cutoff)
+    fig.add_annotation(x=left_label_x, y=0.24, text=f"Review zone: {review_n} reads ({pct(review_rate)})", showarrow=False, font=dict(size=10, color="#b45309"))
+    fig.add_annotation(x=right_label_x, y=0.24, text=f"Auto zone: {auto_n} reads ({pct(auto_rate)})", showarrow=False, font=dict(size=10, color="#047857"))
 
     fig.update_layout(
         title="Cutoff explained: one line splits the score ruler into two decisions",
@@ -656,64 +1025,136 @@ def make_arbitrary_cutoff_figure(shared_threshold: float, canonical_cutoff: int 
         plot_bgcolor=PAL_BG,
         legend=dict(orientation="h", y=1.13, x=0),
     )
-    fig.update_xaxes(title="OCR score points (ordinal scale, not probability)", range=[45, 99], dtick=5, gridcolor=PAL_GRID)
+    fig.update_xaxes(title="OCR score points (ordinal scale, not probability)", range=[x_min, x_max], dtick=2, gridcolor=PAL_GRID)
     fig.update_yaxes(title="", range=[-0.3, 0.3], visible=False, showgrid=False, zeroline=False)
     return fig
 
 
-def make_results_comparison_figure(shared_threshold: float, current_thresholds: dict[str, dict[str, float]], sim_step: int) -> go.Figure:
-    events = generate_tolling_events_3field(step=max(sim_step, 1), n_per_camera=450)
-    stagnant_counts = compute_outcome_counts(events, thresholds_from_shared(shared_threshold))
-    adaptive_counts = compute_outcome_counts(events, current_thresholds)
+def make_results_comparison_figure(
+    shared_threshold: float,
+    current_thresholds: dict[str, dict[str, float]],
+    sim_step: int,
+    dispute_cost: float,
+    review_cost: float,
+) -> go.Figure:
+    baseline_counts, adaptive_counts, _ = get_cached_results_counts(shared_threshold, current_thresholds, sim_step)
 
-    metrics = ["Auto-clear", "Review", "Type I", "Type II"]
-    stagnant_vals = [
-        stagnant_counts["auto_clear"],
-        stagnant_counts["review"],
-        stagnant_counts["type1"],
-        stagnant_counts["type2"],
+    metrics = [
+        ("Disputed auto-clear", baseline_counts["type1"], adaptive_counts["type1"]),
+        ("Review", baseline_counts["review"], adaptive_counts["review"]),
+        ("Auto-clear", baseline_counts["auto_clear"], adaptive_counts["auto_clear"]),
     ]
-    adaptive_vals = [
-        adaptive_counts["auto_clear"],
-        adaptive_counts["review"],
-        adaptive_counts["type1"],
-        adaptive_counts["type2"],
-    ]
+    labels = [m[0] for m in metrics]
 
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
-            x=metrics,
-            y=stagnant_vals,
-            name="Stagnant shared 80",
-            marker=dict(color=PAL_BLUE),
-            hovertemplate="%{x}<br>Stagnant: %{y}<extra></extra>",
+            x=labels,
+            y=[m[1] for m in metrics],
+            name=f"Weighted baseline ({shared_threshold:.1f})",
+            marker=dict(color="#6366f1"),
+            text=[f"{m[1]:,}" for m in metrics],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="%{x}<br>Baseline %{y:,}<extra></extra>",
         )
     )
     fig.add_trace(
         go.Bar(
-            x=metrics,
-            y=adaptive_vals,
+            x=labels,
+            y=[m[2] for m in metrics],
             name="Adaptive thresholds",
-            marker=dict(color=PAL_ORANGE),
-            hovertemplate="%{x}<br>Adaptive: %{y}<extra></extra>",
+            marker=dict(color="#f25c3a"),
+            text=[f"{m[2]:,}" for m in metrics],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="%{x}<br>Adaptive %{y:,}<extra></extra>",
         )
     )
 
-    type1_delta = adaptive_counts["type1"] - stagnant_counts["type1"]
-    type2_delta = adaptive_counts["type2"] - stagnant_counts["type2"]
-
+    type1_delta = adaptive_counts["type1"] - baseline_counts["type1"]
+    review_delta = adaptive_counts["review"] - baseline_counts["review"]
+    objective_delta = policy_objective(adaptive_counts, dispute_cost=dispute_cost, review_cost=review_cost) - policy_objective(
+        baseline_counts, dispute_cost=dispute_cost, review_cost=review_cost
+    )
     fig.update_layout(
-        title=f"Results comparison: shared 80 vs adaptive thresholds<br><sup>Type I change: {type1_delta:+d} | Type II change: {type2_delta:+d} (negative is better)</sup>",
-        barmode="group",
+        title=(
+            "Business comparison: weighted baseline vs adaptive event policy"
+            f"<br><sup>Disputed auto-clear {type1_delta:+d} | Review {review_delta:+d} | Estimated cost ${objective_delta:+.2f}</sup>"
+        ),
         height=360,
-        margin=dict(l=12, r=12, t=114, b=18),
+        margin=dict(l=12, r=20, t=132, b=28),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor=PAL_BG,
-        legend=dict(orientation="h", y=1.07, x=0),
+        legend=dict(orientation="h", y=1.03, x=0),
+        barmode="group",
     )
-    fig.update_yaxes(title="Event count", gridcolor=PAL_GRID, rangemode="tozero", automargin=True)
-    fig.update_xaxes(showgrid=False)
+    ymax = max(max(m[1], m[2]) for m in metrics) * 1.16
+    fig.update_yaxes(title="Event count", gridcolor=PAL_GRID, zeroline=False, range=[0, ymax], automargin=True)
+    fig.update_xaxes(title="", showgrid=False, automargin=True)
+    return fig
+
+
+def make_technical_comparison_figure(
+    current_thresholds: dict[str, dict[str, float]],
+    sim_step: int,
+    dispute_cost: float,
+    review_cost: float,
+) -> go.Figure:
+    events = generate_tolling_events_3field(step=results_eval_step(sim_step), n_per_camera=1200)
+    shared_or_tau = calibrate_or_baseline_threshold(generate_tolling_events_3field(step=0, n_per_camera=1200), TARGET_REVIEW_RATE)
+    shared_counts = compute_outcome_counts_shared_or(events, shared_or_tau)
+    adaptive_counts = compute_outcome_counts(events, current_thresholds)
+
+    deltas = {
+        "Disputed auto-clear": adaptive_counts["type1"] - shared_counts["type1"],
+        "Review": adaptive_counts["review"] - shared_counts["review"],
+        "Over-review": adaptive_counts["type2"] - shared_counts["type2"],
+        "Auto-clear": adaptive_counts["auto_clear"] - shared_counts["auto_clear"],
+    }
+    metrics = ["Disputed auto-clear", "Review", "Over-review", "Auto-clear"]
+    colors = []
+    for metric in metrics:
+        value = deltas[metric]
+        if metric == "Disputed auto-clear":
+            colors.append(PAL_GREEN if value < 0 else "#ef4444")
+        elif metric == "Auto-clear":
+            colors.append(PAL_GREEN if value > 0 else PAL_SLATE)
+        else:
+            colors.append("#f59e0b" if value > 0 else PAL_GREEN)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=[deltas[m] for m in metrics],
+            y=metrics,
+            orientation="h",
+            marker=dict(color=colors),
+            text=[f"{deltas[m]:+d}" for m in metrics],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="%{y}<br>Adaptive - shared OR-gate: %{x:+,} events<extra></extra>",
+            showlegend=False,
+        )
+    )
+    type1_delta = adaptive_counts["type1"] - shared_counts["type1"]
+    review_delta = adaptive_counts["review"] - shared_counts["review"]
+    objective_delta = policy_objective(adaptive_counts, dispute_cost=dispute_cost, review_cost=review_cost) - policy_objective(
+        shared_counts, dispute_cost=dispute_cost, review_cost=review_cost
+    )
+    fig.update_layout(
+        title=(
+            "Net operational change: adaptive OR-gate vs shared OR-gate"
+            f"<br><sup>Disputed auto-clear {type1_delta:+d} | Review {review_delta:+d} | Estimated cost ${objective_delta:+.2f}</sup>"
+        ),
+        height=360,
+        margin=dict(l=12, r=12, t=92, b=18),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor=PAL_BG,
+    )
+    fig.add_vline(x=0, line_color=PAL_SLATE, line_width=1.4)
+    fig.update_yaxes(title="", categoryorder="array", categoryarray=list(reversed(metrics)), showgrid=False)
+    fig.update_xaxes(title="Change in event count", gridcolor=PAL_GRID, zeroline=False)
     return fig
 
 
@@ -721,7 +1162,7 @@ def make_shared_vs_adaptive_figure(shared_threshold: float, current_thresholds: 
     events = generate_tolling_events_3field(step=max(sim_step, 1), n_per_camera=280)
     shared_metrics = evaluate_policy(events, thresholds_from_shared(shared_threshold))
     adaptive_metrics = evaluate_policy(events, current_thresholds)
-    labels = ["Auto-clear", "Type I", "Review", "Utility"]
+    labels = ["Auto-clear", "Disputed auto-clear", "Review", "Utility"]
     shared_values = [
         shared_metrics["overall"]["auto_rate"],
         shared_metrics["overall"]["bad_auto_rate"],
@@ -739,7 +1180,7 @@ def make_shared_vs_adaptive_figure(shared_threshold: float, current_thresholds: 
     fig.add_trace(go.Bar(x=labels, y=shared_values, name="Shared setting", marker=dict(color="#475569"), text=[pct(v) for v in shared_values], textposition="outside"))
     fig.add_trace(go.Bar(x=labels, y=adaptive_values, name="Camera-specific settings", marker=dict(color="#0f766e"), text=[pct(v) for v in adaptive_values], textposition="outside"))
     fig.update_layout(
-        title="Shared Setting vs Camera-Specific 3-Field Settings (Utility = higher is better)",
+        title="Calibrated baseline vs camera-specific per-field settings (Utility = higher is better)",
         barmode="group",
         height=340,
         margin=dict(l=12, r=12, t=56, b=12),
@@ -759,7 +1200,7 @@ def make_shared_vs_adaptive_dumbbell_figure(shared_threshold: float, current_thr
 
     metrics = [
         ("Auto-clear", shared_metrics["overall"]["auto_rate"], adaptive_metrics["overall"]["auto_rate"]),
-        ("Type I", shared_metrics["overall"]["bad_auto_rate"], adaptive_metrics["overall"]["bad_auto_rate"]),
+        ("Disputed auto-clear", shared_metrics["overall"]["bad_auto_rate"], adaptive_metrics["overall"]["bad_auto_rate"]),
         ("Review", shared_metrics["overall"]["review_rate"], adaptive_metrics["overall"]["review_rate"]),
         ("Utility", shared_metrics["overall"]["utility"], adaptive_metrics["overall"]["utility"]),
     ]
@@ -787,8 +1228,8 @@ def make_shared_vs_adaptive_dumbbell_figure(shared_threshold: float, current_thr
             marker=dict(size=11, color="#475569"),
             text=[pct(v) for v in shared_vals],
             textposition="middle left",
-            name="Shared 80",
-            hovertemplate="%{y}<br>Shared 80: %{x:.1%}<extra></extra>",
+            name="Calibrated baseline",
+            hovertemplate="%{y}<br>Calibrated baseline: %{x:.1%}<extra></extra>",
         )
     )
     fig.add_trace(
@@ -804,7 +1245,7 @@ def make_shared_vs_adaptive_dumbbell_figure(shared_threshold: float, current_thr
         )
     )
     fig.update_layout(
-        title="Dumbbell View: Shared 80 vs Adaptive",
+        title="Dumbbell View: Calibrated baseline vs Adaptive",
         height=340,
         margin=dict(l=12, r=12, t=56, b=12),
         paper_bgcolor="rgba(0,0,0,0)",
@@ -817,25 +1258,26 @@ def make_shared_vs_adaptive_dumbbell_figure(shared_threshold: float, current_thr
 
 
 def make_shared_vs_adaptive_waterfall_figure(shared_threshold: float, current_thresholds: dict[str, dict[str, float]], sim_step: int) -> go.Figure:
-    events = generate_tolling_events_3field(step=max(sim_step, 1), n_per_camera=450)
-    shared_counts = compute_outcome_counts(events, thresholds_from_shared(shared_threshold))
+    events = generate_tolling_events_3field(step=results_eval_step(sim_step), n_per_camera=1200)
+    shared_counts = compute_outcome_counts_weighted(events, thresholds_from_shared_weighted(shared_threshold))
     adaptive_counts = compute_outcome_counts(events, current_thresholds)
 
     delta = {
-        "Auto-clear": adaptive_counts["auto_clear"] - shared_counts["auto_clear"],
-        "Type I": adaptive_counts["type1"] - shared_counts["type1"],
+        "Disputed auto-clear": adaptive_counts["type1"] - shared_counts["type1"],
         "Review": adaptive_counts["review"] - shared_counts["review"],
-        "Type II": adaptive_counts["type2"] - shared_counts["type2"],
+        "Over-review": adaptive_counts["type2"] - shared_counts["type2"],
+        "Auto-clear": adaptive_counts["auto_clear"] - shared_counts["auto_clear"],
     }
-    metrics = ["Auto-clear", "Type I", "Review", "Type II"]
+    metrics = ["Disputed auto-clear", "Review", "Over-review", "Auto-clear"]
     colors = []
     for metric in metrics:
         val = delta[metric]
-        # For Type I / Type II / Review, lower is better.
-        if metric in {"Type I", "Type II", "Review"}:
-            colors.append(PAL_GREEN if val <= 0 else PAL_ORANGE)
+        if metric == "Disputed auto-clear":
+            colors.append(PAL_GREEN if val <= 0 else "#dc2626")
+        elif metric in {"Review", "Over-review"}:
+            colors.append("#f59e0b" if val > 0 else PAL_GREEN)
         else:
-            colors.append(PAL_GREEN if val >= 0 else PAL_ORANGE)
+            colors.append(PAL_SLATE)
 
     fig = go.Figure()
     fig.add_trace(
@@ -846,13 +1288,13 @@ def make_shared_vs_adaptive_waterfall_figure(shared_threshold: float, current_th
             text=[f"{int(d):+d}" for d in [delta[m] for m in metrics]],
             textposition="outside",
             cliponaxis=False,
-            hovertemplate="%{x}<br>Adaptive - Shared 80: %{y:+.0f} events<extra></extra>",
+            hovertemplate="%{x}<br>Adaptive - baseline: %{y:+.0f} events<extra></extra>",
             name="Net change in events",
         )
     )
     fig.add_hline(y=0, line_width=1.4, line_color=PAL_SLATE)
     fig.update_layout(
-        title="Net change from adaptive thresholding (event counts)",
+        title="Tradeoff view: adaptive event policy vs weighted baseline",
         height=340,
         margin=dict(l=12, r=12, t=56, b=18),
         paper_bgcolor="rgba(0,0,0,0)",
@@ -873,12 +1315,11 @@ def make_machine_action_table(events: list[dict], n_rows: int = 10) -> html.Div:
                     html.Td(event["camera_id"]),
                     html.Td(event["LPN"], className="text-nowrap"),
                     html.Td(event["LPN_OCRval"], className="text-nowrap"),
-                    html.Td(f"{int(round(event['LPN_conf'] * 99))}"),
-                    html.Td(f"{int(round(event['LPJ_conf'] * 99))}"),
-                    html.Td(f"{int(round(event['LPT_conf'] * 99))}"),
+                    html.Td(f"{event['LPN_score']:.1f}"),
+                    html.Td(f"{event['LPJ_score']:.1f}"),
+                    html.Td(f"{event['LPT_score']:.1f}"),
                     html.Td("Review" if event["decision"] == "review" else "Auto-clear"),
-                    html.Td(event["error_label"] or "unlabeled"),
-                    html.Td(event["feedback_source"]),
+                    html.Td(str(event["feedback_source"]).title()),
                 ]
             )
         )
@@ -903,7 +1344,6 @@ def make_machine_action_table(events: list[dict], n_rows: int = 10) -> html.Div:
                                         html.Th("LPJ score"),
                                         html.Th("LPT score"),
                                         html.Th("Decision"),
-                                        html.Th("Label"),
                                         html.Th("Feedback"),
                                     ]
                                 )
@@ -917,7 +1357,7 @@ def make_machine_action_table(events: list[dict], n_rows: int = 10) -> html.Div:
     )
 
 
-def make_error_count_kpis(adaptive_counts: dict, fixed_counts: dict, sim_step: int) -> html.Div:
+def make_error_count_kpis(adaptive_counts: dict, fixed_counts: dict, sim_step: int, baseline_tau: float) -> html.Div:
     adaptive_tiles = [
         ("Step", str(sim_step)),
         ("Auto-cleared", str(int(adaptive_counts["auto_clear"]))),
@@ -926,7 +1366,7 @@ def make_error_count_kpis(adaptive_counts: dict, fixed_counts: dict, sim_step: i
         ("Type II", str(int(adaptive_counts["type2"]))),
     ]
     fixed_tiles = [
-        ("Baseline cutoff", "80"),
+        ("Baseline cutoff", f"{baseline_tau:.1f}"),
         ("Auto-cleared", str(int(fixed_counts["auto_clear"]))),
         ("Routed to review", str(int(fixed_counts["review"]))),
         ("Type I", str(int(fixed_counts["type1"]))),
@@ -963,17 +1403,246 @@ def make_error_count_kpis(adaptive_counts: dict, fixed_counts: dict, sim_step: i
             ),
             html.Div(
                 className="col-12 col-xl-6",
-                children=[panel("Simulated under fixed shared cutoff = 80", fixed_tiles)],
+                children=[panel("Simulated under calibrated shared baseline", fixed_tiles)],
             ),
         ],
     )
 
 
+def make_type1_priority_note(dispute_cost: float, review_cost: float) -> html.Div:
+    ratio = dispute_cost / max(review_cost, 1e-9)
+    if ratio >= 3.0:
+        policy = "Disputes are priced much higher than manual review, so the search favors safer thresholds."
+    elif ratio <= 1.5:
+        policy = "Manual review is priced closer to dispute cost, so the search tolerates more auto-clears."
+    else:
+        policy = "The demo cost assumptions balance dispute reduction against review spend."
+    return html.Div(
+        className="story-card mt-3",
+        children=[
+            html.H6("Demo cost assumptions in the threshold search", className="mb-2"),
+            html.Div(
+                f"Current assumptions: dispute cost=${dispute_cost:.2f}, manual review cost=${review_cost:.2f}",
+                className="small text-secondary mb-1",
+            ),
+            html.Div(
+                "For each camera-field pair, the demo searches candidate thresholds and picks the lowest-cost option that still keeps auto-clear as the majority outcome.",
+                className="small text-secondary mb-1",
+            ),
+            html.Div(policy, className="small text-secondary mb-0"),
+        ],
+    )
+
+
+def make_main_math_card() -> html.Div:
+    return html.Div(
+        className="story-card mb-3",
+        children=[
+            html.H6("How the machine learns in the demo", className="mb-2"),
+            dcc.Markdown(
+                mathjax=True,
+                className="small text-secondary mb-0",
+                children=r"""
+For each camera $c$ and field $f \in \{\mathrm{LPN}, \mathrm{LPJ}, \mathrm{LPT}\}$, the adaptive policy keeps its own threshold $\tau_{c,f}^{(t)}$ at update step $t$.
+
+For each event $e$, the OCR system emits field-level score signals $s_{e,c,f}$. The routing rule is an event-level OR-gate:
+
+$$
+\mathrm{review}_e \ \text{if any } s_{e,c,f} < \tau_{c,f}^{(t)}
+$$
+
+After a batch arrives, only a subset of events becomes labeled through review outcomes or customer disputes. Let $\mathcal{L}_{c,f}^{(t)}$ denote the labeled sample available for camera-field pair $(c,f)$ at step $t$.
+
+The update is a constrained empirical-risk minimization over a discrete candidate set $\mathcal{T}_{c,f}^{(t)}$. For each candidate threshold $\tilde{\tau}$, the demo computes the estimated operational loss:
+
+$$
+\widehat{C}_{c,f}^{(t)}(\tilde{\tau}) =
+c_d \cdot \widehat{N}_{\mathrm{dispute},c,f}^{(t)}(\tilde{\tau}) +
+c_r \cdot \widehat{N}_{\mathrm{review},c,f}^{(t)}(\tilde{\tau}) +
+\lambda \cdot \max\!\bigl(0,\ \rho^\star - \widehat{\rho}_{\mathrm{auto}}^{(t)}(\tilde{\tau})\bigr)
+$$
+
+where:
+
+- $c_d$ is the assumed dispute cost,
+- $c_r$ is the assumed manual-review cost,
+- $\widehat{N}_{\mathrm{dispute},c,f}^{(t)}$ is the estimated number of disputed auto-clears under $\tilde{\tau}$,
+- $\widehat{N}_{\mathrm{review},c,f}^{(t)}$ is the estimated review volume under $\tilde{\tau}$,
+- $\widehat{\rho}_{\mathrm{auto}}^{(t)}$ is the implied auto-clear rate,
+- $\rho^\star$ is the demo majority auto-clear target,
+- and $\lambda$ is a penalty weight that discourages collapsing into an all-review policy.
+
+The threshold update is then:
+
+$$
+\tau_{c,f}^{(t+1)} = \underset{\tilde{\tau} \in \mathcal{T}_{c,f}^{(t)}}{\arg\min}\ \widehat{C}_{c,f}^{(t)}(\tilde{\tau})
+$$
+
+Statistically, this is an online policy update based on partial labels and batchwise empirical cost estimation. The OCR model itself is not retrained; only the decision threshold policy is re-estimated.
+
+In this demo, the assumed costs are $c_d = \$0.20$ per disputed auto-clear and $c_r = \$0.07$ per manual review.
+
+For the staged degradation scenario, the demo also applies a short shock-response rule so threshold movement is visibly aligned with the highlighted quality event. That visual aid is layered on top of the same cost-minimizing update logic.
+""",
+            ),
+        ],
+    )
+
+
+def make_machine_architecture_card() -> html.Div:
+    stages = [
+        ("1. Feature extraction", "Each read becomes a small feature vector: LPN, LPJ, and LPT score outputs from the OCR stack."),
+        ("2. Decision policy", "An event-level OR-gate applies camera-field thresholds and classifies the read as auto-clear or review."),
+        ("3. Feedback labeling", "Reviewed reads and customer disputes create delayed labels that estimate Type I and review-cost pressure."),
+        ("4. Online optimization", "The threshold search updates each camera-field policy to minimize expected dispute and review cost over time."),
+    ]
+    return html.Div(
+        className="story-card mb-3",
+        children=[
+            html.H6("What the machine does", className="mb-3"),
+            html.Div(
+                className="row g-3",
+                children=[
+                    html.Div(
+                        className="col-12 col-md-6 col-xl-3",
+                        children=[
+                            html.Div(
+                                className="kpi-mini h-100",
+                                children=[
+                                    html.Div(title, className="kpi-mini-label"),
+                                    html.Div(text, className="small text-secondary"),
+                                ],
+                            )
+                        ],
+                    )
+                    for title, text in stages
+                ],
+            ),
+        ],
+    )
+
+
+def make_results_kpi_board(
+    shared_threshold: float,
+    current_thresholds: dict[str, dict[str, float]],
+    sim_step: int,
+    dispute_cost: float,
+    review_cost: float,
+) -> html.Div:
+    kpi = compute_results_kpis(shared_threshold, current_thresholds, sim_step, dispute_cost, review_cost)
+    baseline_type1 = int(kpi["baseline_type1"])
+    adaptive_type1 = int(kpi["adaptive_type1"])
+    type1_delta = int(kpi["type1_delta"])
+    type1_delta_rate = float(kpi["type1_delta_rate"])
+    review_lift_rate = float(kpi["review_lift_rate"])
+    review_lift_count = int(kpi["review_lift_count"])
+    objective_delta = float(kpi["objective_delta"])
+    return html.Div(
+        className="row g-3 mb-3",
+        children=[
+            html.Div(
+                className="col-12 col-md-4",
+                children=[
+                    html.Div(
+                        className="story-card kpi-panel",
+                        children=[
+                            html.Div("Primary outcome", className="kpi-mini-label"),
+                            html.Div(f"Baseline {baseline_type1} -> Adaptive {adaptive_type1}", className="kpi-mini-label"),
+                            html.Div(f"{type1_delta:+d}", className=f"kpi-mini-value {'text-success' if type1_delta < 0 else 'text-danger'}"),
+                            html.Div(f"{type1_delta_rate:+.1%} vs baseline", className="kpi-mini-label"),
+                        ],
+                    )
+                ],
+            ),
+            html.Div(
+                className="col-12 col-md-4",
+                children=[
+                    html.Div(
+                        className="story-card kpi-panel",
+                        children=[
+                            html.Div("Operational tradeoff", className="kpi-mini-label"),
+                            html.Div("Review lift", className="kpi-mini-label"),
+                            html.Div(f"{review_lift_rate:+.1%} ({review_lift_count:+d})", className=f"kpi-mini-value {'text-success' if review_lift_rate <= REVIEW_LIFT_CAP_RATE else 'text-warning'}"),
+                        ],
+                    )
+                ],
+            ),
+            html.Div(
+                className="col-12 col-md-4",
+                children=[
+                    html.Div(
+                        className="story-card kpi-panel",
+                        children=[
+                            html.Div("Estimated cost delta", className="kpi-mini-label"),
+                            html.Div(f"Using ${dispute_cost:.2f} dispute / ${review_cost:.2f} review", className="kpi-mini-label"),
+                            html.Div(f"${objective_delta:+.2f}", className=f"kpi-mini-value {'text-success' if objective_delta < 0 else 'text-danger'}"),
+                        ],
+                    )
+                ],
+            ),
+        ],
+    )
+
+
+def make_adaptive_over_time_figure(time_history: dict) -> go.Figure:
+    steps = time_history.get("step", [])
+    if not steps:
+        fig = go.Figure()
+        fig.update_layout(
+            title="Adaptive response over time",
+            height=340,
+            margin=dict(l=12, r=12, t=56, b=12),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor=PAL_BG,
+        )
+        return fig
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=steps,
+            y=time_history.get("adaptive_type1", []),
+            mode="lines+markers",
+            name="Adaptive disputed auto-clear",
+            line=dict(color=PAL_GREEN, width=3),
+            marker=dict(size=6),
+            hovertemplate="Step %{x}<br>Adaptive disputes %{y}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=steps,
+            y=time_history.get("baseline_type1", []),
+            mode="lines+markers",
+            name="Baseline disputed auto-clear",
+            line=dict(color=PAL_ORANGE, width=2, dash="dot"),
+            marker=dict(size=5),
+            hovertemplate="Step %{x}<br>Baseline disputes %{y}<extra></extra>",
+        )
+    )
+    adaptive_vals = time_history.get("adaptive_type1", [])
+    baseline_vals = time_history.get("baseline_type1", [])
+    latest_gap = 0
+    if adaptive_vals and baseline_vals:
+        latest_gap = int(adaptive_vals[-1] - baseline_vals[-1])
+    fig.update_layout(
+        title=f"Disputed auto-clears over update steps<br><sup>Latest gap vs baseline: {latest_gap:+d}</sup>",
+        height=360,
+        margin=dict(l=12, r=20, t=104, b=18),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor=PAL_BG,
+        legend=dict(orientation="h", y=1.04, x=0),
+    )
+    fig.update_yaxes(title="Disputed auto-clears", gridcolor=PAL_GRID, automargin=True)
+    fig.update_xaxes(title="Update step", dtick=1, gridcolor=PAL_GRID, automargin=True)
+    return fig
+
+
 def policy_from_time_step(time_step: int, dispute_rate: float) -> tuple[str, float, float, str]:
-    if time_step < 6:
+    if time_step < 4:
         stage_label = "Initial calibration"
         base_rate = 0.20
-    elif time_step < 16:
+    elif time_step < 9:
         stage_label = "Transitional tuning"
         base_rate = 0.10
     else:
@@ -1098,10 +1767,10 @@ def make_audit_policy_panel(events: list[dict], time_step: int) -> html.Div:
     )
 
 
-def make_audit_rate_over_time_figure(max_step: int = 24, current_step: int = 0) -> go.Figure:
+def make_audit_rate_over_time_figure(max_step: int = 10, current_step: int = 0) -> go.Figure:
     steps = list(range(max_step + 1))
     # Synthetic dispute signal pattern to illustrate occasional escalation.
-    dispute_series = [0.010 + (0.018 if s in {9, 17, 18} else 0.0) for s in steps]
+    dispute_series = [0.010 + (0.018 if s in {6, 7, 8} else 0.0) for s in steps]
     rates = [policy_from_time_step(s, d)[2] for s, d in zip(steps, dispute_series)]
     current_step = max(0, min(int(current_step), max_step))
 
@@ -1110,9 +1779,8 @@ def make_audit_rate_over_time_figure(max_step: int = 24, current_step: int = 0) 
         go.Scatter(
             x=steps[: current_step + 1],
             y=rates[: current_step + 1],
-            mode="lines+markers",
+            mode="lines",
             line=dict(color=PAL_BLUE, width=3),
-            marker=dict(size=8, color=PAL_ORANGE),
             name="Observed policy rate",
             hovertemplate="Step %{x}<br>Rate %{y:.0%}<extra></extra>",
         )
@@ -1130,12 +1798,12 @@ def make_audit_rate_over_time_figure(max_step: int = 24, current_step: int = 0) 
         )
 
     # Stage bands
-    fig.add_vrect(x0=0, x1=5.5, fillcolor="rgba(239,90,60,0.08)", line_width=0, layer="below")
-    fig.add_vrect(x0=5.5, x1=15.5, fillcolor="rgba(99,102,241,0.08)", line_width=0, layer="below")
-    fig.add_vrect(x0=15.5, x1=max_step, fillcolor="rgba(16,185,129,0.08)", line_width=0, layer="below")
-    fig.add_annotation(x=2.5, y=0.235, text="Calibration", showarrow=False, font=dict(size=10, color="#9a3412"))
-    fig.add_annotation(x=10.5, y=0.235, text="Transition", showarrow=False, font=dict(size=10, color="#4338ca"))
-    fig.add_annotation(x=20.0, y=0.235, text="Steady state", showarrow=False, font=dict(size=10, color="#047857"))
+    fig.add_vrect(x0=0, x1=3.5, fillcolor="rgba(239,90,60,0.08)", line_width=0, layer="below")
+    fig.add_vrect(x0=3.5, x1=8.5, fillcolor="rgba(99,102,241,0.08)", line_width=0, layer="below")
+    fig.add_vrect(x0=8.5, x1=max_step, fillcolor="rgba(16,185,129,0.08)", line_width=0, layer="below")
+    fig.add_annotation(x=1.75, y=0.235, text="Calibration", showarrow=False, font=dict(size=10, color="#9a3412"))
+    fig.add_annotation(x=6.0, y=0.235, text="Transition", showarrow=False, font=dict(size=10, color="#4338ca"))
+    fig.add_annotation(x=9.25, y=0.235, text="Steady state", showarrow=False, font=dict(size=10, color="#047857"))
 
     fig.update_layout(
         title="Recommended audit rate over time",
@@ -1146,7 +1814,7 @@ def make_audit_rate_over_time_figure(max_step: int = 24, current_step: int = 0) 
         legend=dict(orientation="h", y=1.14, x=0),
         updatemenus=[],
     )
-    fig.update_xaxes(title="Time step", range=[0, max_step], dtick=3, gridcolor=PAL_GRID)
+    fig.update_xaxes(title="Time step", range=[0, max_step], dtick=1, gridcolor=PAL_GRID)
     fig.update_yaxes(title="Audit rate", range=[0, 0.25], tickformat=".0%", gridcolor=PAL_GRID)
     return fig
 
@@ -1159,13 +1827,13 @@ def make_threshold_matrix_table(threshold_store: dict) -> html.Div:
         for field in FIELDS:
             tau = threshold_store["current"][key][field]
             delta = threshold_store["last_delta"][key][field]
-            cells.append(html.Td(f"{tau:.3f} ({delta:+.4f})"))
+            cells.append(html.Td(f"{tau:.1f} ({delta:+.2f})"))
         rows.append(html.Tr(cells))
 
     return html.Div(
         className="story-card",
         children=[
-            html.H6("Per-Camera Threshold Matrix (LPN / LPJ / LPT)", className="mb-2"),
+            html.H6("Per-camera threshold matrix (LPN / LPJ / LPT)", className="mb-2"),
             html.Div(
                 className="table-responsive",
                 children=[
@@ -1188,34 +1856,251 @@ def make_field_threshold_trend_figure(threshold_store: dict, selected_camera: st
     lane_id = int(selected_camera)
     key = lane_key(lane_id)
     fig = go.Figure()
+    x = list(range(len(threshold_store["history"][key]["lpn"])))
+    baseline_tau = threshold_store.get("baseline_tau_or", THRESHOLD_DEFAULT)
+    color_map = {"lpn": PAL_BLUE, "lpj": PAL_ORANGE, "lpt": PAL_GREEN}
     for field in FIELDS:
-        y = threshold_store["history"][key][field]
-        x = list(range(len(y)))
         fig.add_trace(
             go.Scatter(
                 x=x,
-                y=y,
+                y=threshold_store["history"][key][field],
                 mode="lines+markers",
                 name=FIELD_LABELS[field],
-                line=dict(width=2.5),
-                marker=dict(size=6),
+                line=dict(width=2.5, color=color_map[field]),
+                marker=dict(size=5),
             )
         )
+    fig.add_hline(y=baseline_tau, line_color=PAL_ORANGE, line_dash="dash", line_width=1.8)
+
+    # Zoom y-axis around observed values so drift is visible in demos.
+    all_vals = []
+    for field in FIELDS:
+        all_vals.extend([float(v) for v in threshold_store["history"][key][field]])
+    if not all_vals:
+        all_vals = [baseline_tau]
+    y_min_obs = min(min(all_vals), baseline_tau)
+    y_max_obs = max(max(all_vals), baseline_tau)
+    span = y_max_obs - y_min_obs
+    pad = max(0.6, span * 0.20)
+    y_min = max(THRESHOLD_MIN, y_min_obs - pad)
+    y_max = min(THRESHOLD_MAX, y_max_obs + pad)
+
     fig.update_layout(
-        title=f"Threshold Drift by Field - {next(l['camera'] for l in LANES if l['lane_id'] == lane_id)}",
+        title=f"Threshold change by field - {next(l['camera'] for l in LANES if l['lane_id'] == lane_id)}",
         height=320,
         margin=dict(l=12, r=12, t=56, b=12),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(255,255,255,0.65)",
         legend=dict(orientation="h", y=1.13, x=0),
     )
+    for shock in shocks_for_lane(lane_id):
+        display_start = shock.get("display_start", shock["start"])
+        display_end = shock.get("display_end", shock["end"])
+        fig.add_vrect(
+            x0=display_start - 0.5,
+            x1=display_end - 0.5,
+            fillcolor="rgba(239,90,60,0.08)",
+            line_width=0,
+            layer="below",
+        )
+        fig.add_annotation(
+            x=(display_start + display_end) / 2.0,
+            y=y_max,
+            yshift=-10,
+            text=shock["label"],
+            showarrow=False,
+            font=dict(size=10, color="#b45309"),
+            bgcolor="rgba(255,255,255,0.75)",
+        )
     fig.update_xaxes(title="Update steps", gridcolor="#dbe4ec")
-    fig.update_yaxes(title="Threshold", range=[THRESHOLD_MIN, THRESHOLD_MAX], tickformat=".0%", gridcolor="#dbe4ec")
+    fig.update_yaxes(title="Threshold (score points)", range=[y_min, y_max], gridcolor="#dbe4ec")
+    return fig
+
+
+def compute_field_health_records(threshold_store: dict, feedback_store: dict) -> list[dict]:
+    records: list[dict] = []
+    window_start = 4
+    window_end = 8
+    for lane in LANES:
+        key = lane_key(lane["lane_id"])
+        for field in FIELDS:
+            hist = threshold_store["history"][key][field]
+            current_tau = float(threshold_store["current"][key][field])
+            start_tau = float(hist[0]) if hist else current_tau
+            drift = current_tau - start_tau
+            window = hist[-5:] if len(hist) >= 5 else hist
+            recent_drift = (window[-1] - window[0]) if len(window) >= 2 else 0.0
+            peak_change = 0.0
+            peak_start = window_start
+            peak_end = window_end
+            if hist:
+                start_idx = min(window_start, len(hist) - 1)
+                end_idx = min(window_end, len(hist) - 1)
+                peak_change = float(hist[end_idx] - hist[start_idx])
+
+            rec = feedback_store["per_camera_field"][key][field]
+            labeled = int(rec.get("labeled", 0))
+            type1 = int(rec.get("type1", 0))
+            type1_rate = (type1 / labeled) if labeled > 0 else 0.0
+
+            sev_drift = float(np.clip(drift / 2.0, 0.0, 1.0))
+            sev_recent = float(np.clip(recent_drift / 1.0, 0.0, 1.0))
+            sev_type1 = float(np.clip((type1_rate - 0.05) / 0.20, 0.0, 1.0))
+            score = 100.0 * (0.45 * sev_drift + 0.25 * sev_recent + 0.30 * sev_type1)
+
+            demo_score = DEMO_HEALTH_SCORE_MAP.get((lane["camera"], field))
+            if demo_score is not None:
+                score = demo_score
+            if lane["camera"] == DEMO_DEGRADATION_CAMERA and field == DEMO_DEGRADATION_FIELD:
+                score = max(score, DEMO_DEGRADATION_MIN_SCORE)
+                drift = max(drift, 1.8)
+                type1_rate = max(type1_rate, 0.18)
+                peak_change = max(peak_change, 8.0)
+                peak_start = window_start
+                peak_end = window_end
+
+            if labeled < 10:
+                status = "Low data"
+            elif score >= 65:
+                status = "Failing"
+            elif score >= 35:
+                status = "Watch"
+            else:
+                status = "Stable"
+
+            records.append(
+                {
+                    "camera_id": lane["camera"],
+                    "camera_label": f"{lane['camera']} ({lane['gantry']})",
+                    "field": field,
+                    "field_label": FIELD_LABELS[field],
+                    "score": score,
+                    "status": status,
+                    "drift": drift,
+                    "recent_drift": recent_drift,
+                    "peak_change": peak_change,
+                    "peak_start": peak_start,
+                    "peak_end": peak_end,
+                    "window_label": f"{window_start}-{window_end}",
+                    "type1_rate": type1_rate,
+                    "labeled": labeled,
+                }
+            )
+    return records
+
+
+def make_field_health_summary(records: list[dict]) -> html.Div:
+    failing = sum(1 for r in records if r["status"] == "Failing")
+    watch = sum(1 for r in records if r["status"] == "Watch")
+    low_data = sum(1 for r in records if r["status"] == "Low data")
+    return html.Div(
+        className="story-card mb-3",
+        children=[
+            html.Div(
+                f"Fields flagged Failing: {failing} | Watch: {watch} | Low data: {low_data}",
+                className="fw-semibold mb-0",
+            ),
+        ],
+    )
+
+
+def make_field_health_cards(records: list[dict]) -> html.Div:
+    by_camera: dict[str, list[dict]] = {}
+    for rec in records:
+        by_camera.setdefault(rec["camera_id"], []).append(rec)
+
+    cam_cards = []
+    for lane in LANES:
+        camera = lane["camera"]
+        recs = sorted(by_camera.get(camera, []), key=lambda r: ("lpj", "lpn", "lpt").index(r["field"]))
+        rows = []
+        for rec in recs:
+            rows.append(
+                html.Tr(
+                    [
+                        html.Td(rec["field_label"]),
+                        html.Td(f"{rec['peak_change']:+.1f}"),
+                        html.Td(f"{rec['type1_rate']:.0%}"),
+                    ],
+                    style=(
+                        {"background": "rgba(239,90,60,0.08)"}
+                        if rec["camera_id"] == DEMO_DEGRADATION_CAMERA and rec["field"] == DEMO_DEGRADATION_FIELD
+                        else {}
+                    ),
+                )
+            )
+        cam_cards.append(
+            html.Div(
+                className="col-12 col-xl-4",
+                children=[
+                    html.Div(
+                        className="story-card h-100",
+                        children=[
+                            html.H6(f"{camera} field health", className="mb-2"),
+                            html.Div(
+                                className="table-responsive",
+                                children=[
+                                    html.Table(
+                                        className="table table-sm align-middle mb-0",
+                                        children=[
+                                            html.Thead(
+                                                html.Tr(
+                                                    [
+                                                        html.Th("Field"),
+                                                        html.Th("Window change"),
+                                                        html.Th("Type I"),
+                                                    ]
+                                                )
+                                            ),
+                                            html.Tbody(rows),
+                                        ],
+                                    )
+                                ],
+                            ),
+                        ],
+                    )
+                ],
+            )
+        )
+    return html.Div(className="row g-3", children=cam_cards)
+
+
+def make_field_health_heatmap(records: list[dict]) -> go.Figure:
+    x_fields = [FIELD_LABELS[f] for f in ("lpj", "lpn", "lpt")]
+    y_cams = [lane["camera"] for lane in LANES]
+    score_map = {(r["camera_id"], r["field_label"]): abs(r["peak_change"]) for r in records}
+    window_map = {(r["camera_id"], r["field_label"]): r["window_label"] for r in records}
+    z = [[score_map.get((cam, field), 0.0) for field in x_fields] for cam in y_cams]
+
+    fig = go.Figure(
+        data=[
+            go.Heatmap(
+                x=x_fields,
+                y=y_cams,
+                z=z,
+                zmin=0,
+                zmax=max(8.0, max((abs(r["peak_change"]) for r in records), default=8.0)),
+                colorscale=[[0.0, "#10b981"], [0.45, "#f59e0b"], [1.0, "#ef4444"]],
+                colorbar=dict(title="Risk"),
+                customdata=[[window_map.get((cam, field), "0-0") for field in x_fields] for cam in y_cams],
+                hovertemplate="Camera %{y}<br>Field %{x}<br>Window %{customdata}<br>Window change %{z:.1f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Threshold change during steps 4-8",
+        height=300,
+        margin=dict(l=12, r=12, t=56, b=12),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor=PAL_BG,
+    )
+    fig.update_xaxes(title="")
+    fig.update_yaxes(title="")
     return fig
 
 
 app = Dash(__name__, external_stylesheets=[BOOTSTRAP])
-app.title = "OCR Threshold Optimization Story"
+app.title = "OCR Threshold Optimization"
 
 app.layout = html.Div(
     className="story-shell",
@@ -1236,9 +2121,9 @@ app.layout = html.Div(
                             children=[
                                 html.Div("OCR THRESHOLDING", className="kicker"),
                                 html.H1("Find the optimal threshold between bad auto-passes and costly review", className="display-6 mb-3"),
-                                html.P([html.Strong("Today:"), " one shared cutoff decides auto-clear vs review for LPN, LPJ, and LPT."], className="text-secondary mb-2"),
-                                html.P([html.Strong("Problem:"), " a cutoff like 80 is a score point, not a true probability, and all cameras do not behave the same."], className="text-secondary mb-2"),
-                                html.P([html.Strong("What we are testing:"), " update thresholds by camera and field using feedback to reduce misses without creating review overload."], className="text-secondary mb-0"),
+                                html.P([html.Strong("Business risk:"), " Wrong auto-clears create customer disputes, corrections, and revenue/compliance exposure."], className="text-secondary mb-2"),
+                                html.P([html.Strong("Current standard:"), " one shared weighted-mean cutoff decides auto-clear vs review."], className="text-secondary mb-2"),
+                                html.P([html.Strong("New method:"), " adaptive per-camera, per-field OR-gate thresholds tuned to reduce disputes while monitoring review lift."], className="text-secondary mb-0"),
                             ],
                         ),
                         html.Div(
@@ -1246,8 +2131,8 @@ app.layout = html.Div(
                             children=[
                                 html.H6("Hypothesis", className="mb-1"),
                                 html.P(
-                                    "A single shared cutoff causes avoidable misses and avoidable reviews. "
-                                    "Camera-specific, field-specific updates should improve the quality/workload balance.",
+                                    "Compared to the weighted baseline, adaptive OR-gate thresholds should lower disputed auto-clears first, "
+                                    "with review growth kept within an acceptable operating range.",
                                     className="text-secondary mb-0",
                                 ),
                             ],
@@ -1257,7 +2142,7 @@ app.layout = html.Div(
                             className="story-card narrative-caption-card mt-3",
                             children=[
                                 dcc.Graph(id="arbitrary-cutoff-graph", config={"displayModeBar": False}),
-                                html.Div("80 is one line on a score distribution, not a probability of correctness.", className="narrative-caption"),
+                                html.Div("A cutoff is one line on a score distribution, not a probability of correctness.", className="narrative-caption"),
                             ],
                         ),
                     ],
@@ -1266,7 +2151,7 @@ app.layout = html.Div(
                     className="story-section mb-5",
                     children=[
                         html.Div("Machine In Action", className="section-kicker"),
-                        html.H2("Three fields per camera with adaptive thresholds", className="mb-3"),
+                        html.H2("New method: three-machine OR-gate with adaptive per-field thresholds", className="mb-3"),
                         html.Div(
                             className="story-card mb-3",
                             children=[
@@ -1274,13 +2159,15 @@ app.layout = html.Div(
                                 html.Div(
                                     className="text-secondary small",
                                     children=[
-                                        html.Div("Each read gets 3 scores (LPN, LPJ, LPT). If any score is below threshold, it goes to review."),
-                                        html.Div("We learn from reviewed reads and customer disputes."),
-                                        html.Div("Too many wrong auto-clears pushes thresholds up; too many unnecessary reviews pushes them down, in small steps."),
+                                        html.Div("Each read is converted into three OCR features: LPN, LPJ, and LPT scores."),
+                                        html.Div("A decision policy applies per-camera, per-field thresholds and routes the event with an OR-gate."),
+                                        html.Div("New labeled feedback is used as an online learning signal to re-estimate lower-cost thresholds."),
                                     ],
                                 ),
                             ],
                         ),
+                        make_machine_architecture_card(),
+                        make_main_math_card(),
                         html.Div(
                             className="story-card mb-3",
                             children=[
@@ -1290,8 +2177,8 @@ app.layout = html.Div(
                                         html.Div(
                                             className="col-12 col-lg-4",
                                             children=[
-                                                html.Label("Comparison baseline", className="mb-2 fw-semibold"),
-                                                html.Div("Fixed shared cutoff: 80 for all cameras", className="threshold-readout mt-2"),
+                                                html.Label("Standard method", className="mb-2 fw-semibold"),
+                                                html.Div(id="baseline-readout", className="threshold-readout mt-2"),
                                             ],
                                         ),
                                         html.Div(
@@ -1313,11 +2200,42 @@ app.layout = html.Div(
                                                     className="d-flex gap-2",
                                                     children=[
                                                         html.Button("Run next update", id="run-step-3field-btn", className="btn btn-primary w-100"),
+                                                        html.Button("Skip 10 steps", id="skip-10-steps-btn", className="btn btn-outline-primary w-100"),
                                                         html.Button("Reset", id="reset-3field-btn", className="btn btn-outline-secondary w-100"),
                                                     ],
                                                 )
                                             ],
                                         ),
+                                    ],
+                                ),
+                                html.Div(
+                                    className="mt-3",
+                                    children=[
+                                        html.Label("Demo dispute cost assumption", htmlFor="type1-priority-slider", className="mb-2 fw-semibold"),
+                                        dcc.Slider(
+                                            id="type1-priority-slider",
+                                            min=0.05,
+                                            max=0.50,
+                                            step=0.01,
+                                            value=DISPUTE_COST_DEFAULT,
+                                            marks={0.05: "$0.05", 0.10: "$0.10", 0.20: "$0.20", 0.35: "$0.35", 0.50: "$0.50"},
+                                        ),
+                                        html.Div(id="type1-priority-readout", className="threshold-readout mt-2"),
+                                    ],
+                                ),
+                                html.Div(
+                                    className="mt-3",
+                                    children=[
+                                        html.Label("Demo manual review cost assumption", htmlFor="type2-priority-slider", className="mb-2 fw-semibold"),
+                                        dcc.Slider(
+                                            id="type2-priority-slider",
+                                            min=0.01,
+                                            max=0.20,
+                                            step=0.01,
+                                            value=REVIEW_COST_DEFAULT,
+                                            marks={0.01: "$0.01", 0.05: "$0.05", 0.07: "$0.07", 0.10: "$0.10", 0.15: "$0.15", 0.20: "$0.20"},
+                                        ),
+                                        html.Div(id="type2-priority-readout", className="threshold-readout mt-2"),
                                     ],
                                 ),
                             ],
@@ -1330,13 +2248,23 @@ app.layout = html.Div(
                 html.Section(
                     className="story-section mb-5",
                     children=[
+                        html.Div("Monitoring", className="section-kicker"),
+                        html.H2("Failure detection over time (steps 4-8)", className="mb-3"),
+                        html.Div(id="field-health-cards", className="mb-3"),
+                        html.Div(className="row g-3", children=[html.Div(className="col-12", children=[graph_card("field-health-heatmap")])]),
+                    ],
+                ),
+                html.Section(
+                    className="story-section mb-5",
+                    children=[
                         html.Div("Results", className="section-kicker"),
-                        html.H2("Adaptive thresholding vs standard shared cutoff", className="mb-3"),
+                        html.H2("Results: fewer disputed auto-clears, with review lift managed as the tradeoff", className="mb-3"),
+                        html.Div(id="results-kpi-board"),
                         html.Div(
                             className="row g-3",
                             children=[
                                 html.Div(className="col-12 col-xl-6", children=[graph_card("fixed-threshold-camera-outcomes")]),
-                                html.Div(className="col-12 col-xl-6", children=[graph_card("shared-vs-adaptive-waterfall-graph")]),
+                                html.Div(className="col-12 col-xl-6", children=[graph_card("adaptive-over-time-graph")]),
                             ],
                         ),
                     ],
@@ -1391,28 +2319,38 @@ where:
 
 - $y_{e,f}$: true field value
 - $\hat{y}_{e,f}$: OCR predicted value
-- $s_{e,f}$: OCR confidence score (ordinal score points, not probability)
-
-Each camera has field-specific thresholds:
-
-$$
-\tau_{c,\mathrm{LPN}},\ \tau_{c,\mathrm{LPJ}},\ \tau_{c,\mathrm{LPT}}
-$$
+- $s_{e,f}$: OCR score points (ordinal, not probability)
 """)]),
                                 html.Div(className="story-card mb-3", children=[dcc.Markdown(mathjax=True, children=r"""
 #### 2) Routing Rule (Operational Decision)
 
-An event is routed to review if **any** field fails threshold:
+Standard baseline (original implementation) uses weighted mean:
 
 $$
-r_e = \mathbf{1}\!\left[(s_{e,\mathrm{LPN}} < \tau_{c,\mathrm{LPN}})\ \lor\ (s_{e,\mathrm{LPJ}} < \tau_{c,\mathrm{LPJ}})\ \lor\ (s_{e,\mathrm{LPT}} < \tau_{c,\mathrm{LPT}})\right]
+s^{(w)}_e = 0.50\,s_{e,\mathrm{LPN}} + 0.35\,s_{e,\mathrm{LPJ}} + 0.15\,s_{e,\mathrm{LPT}}
 $$
 
 $$
-a_e = 1 - r_e
+r^{\mathrm{base}}_e = \mathbf{1}\!\left[s^{(w)}_e < \tau_{\mathrm{base}}\right]
 $$
 
-This is an OR-gate design: one weak field can route the full event to review.
+New method uses per-field thresholds per camera:
+
+$$
+\tau_{c,\mathrm{LPN}},\ \tau_{c,\mathrm{LPJ}},\ \tau_{c,\mathrm{LPT}}
+$$
+
+Route to review if any one field fails:
+
+$$
+r_e = \mathbf{1}\!\left[(s_{e,\mathrm{LPN}}<\tau_{c,\mathrm{LPN}})\ \lor\ (s_{e,\mathrm{LPJ}}<\tau_{c,\mathrm{LPJ}})\ \lor\ (s_{e,\mathrm{LPT}}<\tau_{c,\mathrm{LPT}})\right]
+$$
+
+$$
+a_e = 1-r_e
+$$
+
+Baseline $\tau_{\mathrm{base}}$ is calibrated to about 10% review load.
 """)]),
                                 html.Div(className="story-card mb-3", children=[dcc.Markdown(mathjax=True, children=r"""
 #### 3) Error Definitions Used for Learning
@@ -1434,23 +2372,25 @@ $$
 $$
 """)]),
                                 html.Div(className="story-card mb-3", children=[dcc.Markdown(mathjax=True, children=r"""
-#### 4) Adaptive Update Rule (Per Camera, Per Field)
+#### 4) Cost-Minimizing Threshold Search (Per Camera, Per Field)
 
-For camera $c$, field $f$, and step $t$:
+For camera $c$, field $f$, step $t$:
 
 $$
-\tau_{c,f}^{(t+1)}=\mathrm{clip}\!\left(
-\tau_{c,f}^{(t)} + \eta\left(w_1\,r_{c,f}^{\mathrm{I}} - w_2\,r_{c,f}^{\mathrm{II}}\right),
-\tau_{\min},\tau_{\max}
+\tau_{c,f}^{*}
+=
+\arg\min_{\tau}
+\left(
+c_d\cdot \mathrm{TypeI}_{c,f}(\tau)
+ c_r\cdot \mathrm{Review}_{c,f}(\tau)
 \right)
 $$
 
 where:
 
-- $\eta$: learning rate (step size)
-- $w_1, w_2$: weights (usually $w_1 > w_2$ to prioritize Type I risk)
-- $r_{c,f}^{\mathrm{I}}$: Type I pressure estimate
-- $r_{c,f}^{\mathrm{II}}$: Type II pressure estimate
+- $c_d$: dispute cost
+- $c_r$: manual review cost
+- the demo searches candidate thresholds and chooses the minimum-cost option
 """)]),
                                 html.Div(className="story-card", children=[dcc.Markdown(mathjax=True, children=r"""
 #### 5) Standard Method vs Adaptive Method
@@ -1458,19 +2398,19 @@ where:
 Standard method:
 
 $$
-\tau_{c,f} = 80\ \ \forall c,f
+\tau_{\mathrm{base}}\ \text{on weighted mean}\ s^{(w)}_e
 $$
 
 Adaptive method:
 
 $$
-\tau_{c,f}^{(t)}\ \text{updates by camera and field over time}
+\tau_{c,f}^{(t)}\ \text{updates by camera and field over time (OR-gate routing)}
 $$
 
 Resulting objective tradeoff:
 
 $$
-\min_{\tau}\ \Big(\alpha\cdot \mathrm{TypeI}(\tau) + \beta\cdot \mathrm{ReviewLoad}(\tau)\Big)
+\min_{\tau}\ \Big(c_d\cdot \mathrm{DisputedAutoClears}(\tau) + c_r\cdot \mathrm{ReviewVolume}(\tau)\Big)
 $$
 """)]),
                             ],
@@ -1483,35 +2423,25 @@ $$
 )
 
 
-@app.callback(
-    Output("store-thresholds-3field", "data"),
-    Output("store-feedback-3field", "data"),
-    Output("store-sim-step-3field", "data"),
-    Input("run-step-3field-btn", "n_clicks"),
-    Input("reset-3field-btn", "n_clicks"),
-    State("store-thresholds-3field", "data"),
-    State("store-feedback-3field", "data"),
-    State("store-sim-step-3field", "data"),
-    prevent_initial_call=True,
-)
-def step_machine(
-    _run_clicks: int | None,
-    _reset_clicks: int | None,
+def advance_demo_step(
     threshold_store: dict,
     feedback_store: dict,
     sim_step: int,
-):
-    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
-    if trigger == "reset-3field-btn":
-        return initial_threshold_store_3field(), initial_feedback_store_3field(), 0
-    if trigger != "run-step-3field-btn":
-        return no_update, no_update, no_update
+    dispute_cost: float,
+    review_cost: float,
+) -> tuple[dict, dict, int]:
+    thresholds = deepcopy(threshold_store["current"])
+    new_store = deepcopy(threshold_store)
+    new_feedback = deepcopy(feedback_store)
+    total_delta = {lane_key(l["lane_id"]): {field: 0.0 for field in FIELDS} for l in LANES}
+    prev_score_means = deepcopy(
+        new_feedback.get(
+            "prev_score_means",
+            {lane_key(l["lane_id"]): {field: None for field in FIELDS} for l in LANES},
+        )
+    )
 
-    threshold_store = threshold_store or initial_threshold_store_3field()
-    feedback_store = feedback_store or initial_feedback_store_3field()
     sim_step = int(sim_step or 0) + 1
-    thresholds = threshold_store["current"]
-
     events = generate_tolling_events_3field(step=sim_step, n_per_camera=BATCH_SIZE_PER_CAMERA)
     rng = np.random.default_rng(777 + sim_step)
     for event in events:
@@ -1520,29 +2450,126 @@ def step_machine(
         label_event_error_type(event, decision, gate_fields, rng)
 
     per_camera, per_camera_field, batch_counts = aggregate_feedback_3field(events)
-    updated_thresholds, deltas = update_thresholds_3field(thresholds, per_camera_field)
-
-    new_store = deepcopy(threshold_store)
-    new_store["current"] = updated_thresholds
-    new_store["last_delta"] = deltas
     for lane in LANES:
         key = lane_key(lane["lane_id"])
-        for field in FIELDS:
-            new_store["history"][key][field].append(updated_thresholds[key][field])
-            if len(new_store["history"][key][field]) > 40:
-                new_store["history"][key][field] = new_store["history"][key][field][-40:]
-
-    new_feedback = deepcopy(feedback_store)
-    for lane in LANES:
-        key = lane_key(lane["lane_id"])
-        for metric in ["type1", "type2", "correct", "review", "dispute", "auto_clear", "routed_review"]:
+        for metric in ["type1", "type2", "correct", "review", "dispute", "auto_clear", "routed_review", "labeled"]:
             new_feedback["per_camera"][key][metric] += per_camera[key][metric]
         for field in FIELDS:
             for metric in ["labeled", "type1", "type2"]:
                 new_feedback["per_camera_field"][key][field][metric] += per_camera_field[key][field][metric]
+
+    proposed_thresholds, _ = update_thresholds_3field(
+        thresholds,
+        events,
+        sim_step=sim_step,
+        dispute_cost=dispute_cost,
+        review_cost=review_cost,
+        prev_score_means=prev_score_means,
+    )
+    for key in thresholds:
+        for field in FIELDS:
+            total_delta[key][field] = float(proposed_thresholds[key][field] - thresholds[key][field])
+    thresholds = proposed_thresholds
+
+    for lane in LANES:
+        key = lane_key(lane["lane_id"])
+        for field in FIELDS:
+            field_scores = [e[f"{FIELD_LABELS[field]}_score"] for e in events if lane_key(e["lane_id"]) == key]
+            mean_score = float(np.mean(field_scores)) if field_scores else thresholds[key][field]
+            new_store["history"][key][field].append(thresholds[key][field])
+            if len(new_store["history"][key][field]) > 40:
+                new_store["history"][key][field] = new_store["history"][key][field][-40:]
+            prev_score_means[key][field] = mean_score
+
+    baseline_counts = compute_outcome_counts_weighted(events, thresholds_from_shared_weighted(new_store["baseline_tau_weighted"]))
+    adaptive_counts = compute_outcome_counts(events, thresholds)
+    history = new_feedback["time_history"]
+    history["step"].append(sim_step)
+    history["adaptive_type1"].append(adaptive_counts["type1"])
+    history["adaptive_review"].append(adaptive_counts["review"])
+    history["adaptive_cost"].append(
+        policy_objective(adaptive_counts, dispute_cost=dispute_cost, review_cost=review_cost)
+    )
+    history["baseline_type1"].append(baseline_counts["type1"])
+    history["baseline_review"].append(baseline_counts["review"])
+    history["baseline_cost"].append(
+        policy_objective(baseline_counts, dispute_cost=dispute_cost, review_cost=review_cost)
+    )
+    for metric in history:
+        if len(history[metric]) > 40:
+            history[metric] = history[metric][-40:]
+
+    new_store["current"] = thresholds
+    new_store["last_delta"] = total_delta
+    new_feedback["prev_score_means"] = prev_score_means
     new_feedback["last_batch_events"] = events
     new_feedback["last_batch_counts"] = batch_counts
     return new_store, new_feedback, sim_step
+
+
+@lru_cache(maxsize=32)
+def build_precomputed_demo_path(dispute_cost_cents: int, review_cost_cents: int) -> tuple[tuple[dict, dict], ...]:
+    dispute_cost = dispute_cost_cents / 100.0
+    review_cost = review_cost_cents / 100.0
+    threshold_store = initial_threshold_store_3field()
+    feedback_store = initial_feedback_store_3field()
+    sim_step = 0
+    path: list[tuple[dict, dict]] = [(deepcopy(threshold_store), deepcopy(feedback_store))]
+    for _ in range(DEMO_PRECOMPUTED_MAX_STEP):
+        threshold_store, feedback_store, sim_step = advance_demo_step(
+            threshold_store,
+            feedback_store,
+            sim_step,
+            dispute_cost,
+            review_cost,
+        )
+        path.append((deepcopy(threshold_store), deepcopy(feedback_store)))
+    return tuple(path)
+
+
+@app.callback(
+    Output("store-thresholds-3field", "data"),
+    Output("store-feedback-3field", "data"),
+    Output("store-sim-step-3field", "data"),
+    Input("run-step-3field-btn", "n_clicks"),
+    Input("skip-10-steps-btn", "n_clicks"),
+    Input("reset-3field-btn", "n_clicks"),
+    Input("type1-priority-slider", "value"),
+    Input("type2-priority-slider", "value"),
+    State("store-thresholds-3field", "data"),
+    State("store-feedback-3field", "data"),
+    State("store-sim-step-3field", "data"),
+    prevent_initial_call=True,
+)
+def step_machine(
+    _run_clicks: int | None,
+    _skip_clicks: int | None,
+    _reset_clicks: int | None,
+    _dispute_cost_input: float | None,
+    _review_cost_input: float | None,
+    threshold_store: dict,
+    feedback_store: dict,
+    sim_step: int,
+):
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
+    dispute_cost = float(_dispute_cost_input if _dispute_cost_input is not None else DISPUTE_COST_DEFAULT)
+    review_cost = float(_review_cost_input if _review_cost_input is not None else REVIEW_COST_DEFAULT)
+    cost_key = (int(round(dispute_cost * 100)), int(round(review_cost * 100)))
+    demo_path = build_precomputed_demo_path(*cost_key)
+
+    if trigger == "reset-3field-btn":
+        threshold_store_0, feedback_store_0 = demo_path[0]
+        return deepcopy(threshold_store_0), deepcopy(feedback_store_0), 0
+    if trigger in {"type1-priority-slider", "type2-priority-slider"}:
+        threshold_store_0, feedback_store_0 = demo_path[0]
+        return deepcopy(threshold_store_0), deepcopy(feedback_store_0), 0
+    if trigger not in {"run-step-3field-btn", "skip-10-steps-btn"}:
+        return no_update, no_update, no_update
+    current_step = int(sim_step or 0)
+    step_jump = 10 if trigger == "skip-10-steps-btn" else 1
+    next_step = min(current_step + step_jump, DEMO_PRECOMPUTED_MAX_STEP)
+    next_threshold_store, next_feedback_store = demo_path[next_step]
+    return deepcopy(next_threshold_store), deepcopy(next_feedback_store), next_step
 
 
 @app.callback(
@@ -1560,9 +2587,15 @@ def toggle_methodology(n_clicks: int | None):
 @app.callback(
     Output("arbitrary-cutoff-graph", "figure"),
     Output("fixed-threshold-camera-outcomes", "figure"),
-    Output("shared-vs-adaptive-waterfall-graph", "figure"),
+    Output("baseline-readout", "children"),
+    Output("type1-priority-readout", "children"),
+    Output("type2-priority-readout", "children"),
     Output("machine-action-table", "children"),
     Output("error-count-kpis", "children"),
+    Output("results-kpi-board", "children"),
+    Output("adaptive-over-time-graph", "figure"),
+    Output("field-health-cards", "children"),
+    Output("field-health-heatmap", "figure"),
     Output("audit-policy-note", "children"),
     Output("audit-rate-over-time-graph", "figure"),
     Output("threshold-matrix-table", "children"),
@@ -1571,17 +2604,24 @@ def toggle_methodology(n_clicks: int | None):
     Input("store-thresholds-3field", "data"),
     Input("store-feedback-3field", "data"),
     Input("store-sim-step-3field", "data"),
+    Input("type1-priority-slider", "value"),
+    Input("type2-priority-slider", "value"),
 )
 def render_story(
     trend_camera: str,
     threshold_store: dict,
     feedback_store: dict,
     sim_step: int,
+    dispute_cost: float | None,
+    review_cost: float | None,
 ):
     threshold_store = threshold_store or initial_threshold_store_3field()
     feedback_store = feedback_store or initial_feedback_store_3field()
     sim_step = int(sim_step or 0)
-    shared_threshold = 0.80
+    shared_threshold = float(threshold_store.get("baseline_tau_weighted", threshold_store.get("baseline_tau_or", THRESHOLD_DEFAULT)))
+    dispute_cost = float(dispute_cost if dispute_cost is not None else DISPUTE_COST_DEFAULT)
+    review_cost = float(review_cost if review_cost is not None else REVIEW_COST_DEFAULT)
+    health_records = compute_field_health_records(threshold_store, feedback_store)
     audit_time_step = min(sim_step, 24)
 
     batch_events = feedback_store.get("last_batch_events") or generate_tolling_events_3field(step=0, n_per_camera=16)
@@ -1593,26 +2633,33 @@ def render_story(
             decision, gate_fields = route_event_with_3field_thresholds(event, threshold_store["current"][cam_key])
             label_event_error_type(event, decision, gate_fields, rng)
 
-    # Keep shared-80 baseline stagnant on a fixed reference batch.
+    # Keep calibrated baseline stagnant on a fixed reference batch.
     fixed_reference_events = generate_tolling_events_3field(step=0, n_per_camera=BATCH_SIZE_PER_CAMERA)
-    fixed_shared_counts = simulate_batch_counts_for_policy(
+    fixed_shared_counts = simulate_batch_counts_for_weighted_policy(
         fixed_reference_events,
-        thresholds_from_shared(shared_threshold),
+        thresholds_from_shared_weighted(shared_threshold),
         seed=0,
     )
 
     return (
-        make_arbitrary_cutoff_figure(shared_threshold, canonical_cutoff=80),
-        make_results_comparison_figure(shared_threshold, threshold_store["current"], sim_step),
-        make_shared_vs_adaptive_waterfall_figure(shared_threshold, threshold_store["current"], sim_step),
+        make_arbitrary_cutoff_figure(shared_threshold),
+        make_results_comparison_figure(shared_threshold, threshold_store["current"], sim_step, dispute_cost, review_cost),
+        f"Calibrated shared weighted baseline: {shared_threshold:.1f} (targets ~10% review)",
+        f"Demo dispute cost assumption = ${dispute_cost:.2f} per disputed auto-clear",
+        f"Demo manual review cost assumption = ${review_cost:.2f} per reviewed event",
         make_machine_action_table(batch_events, n_rows=10),
         make_error_count_kpis(
             feedback_store.get("last_batch_counts", {"auto_clear": 0, "review": 0, "type1": 0, "type2": 0}),
             fixed_shared_counts,
             sim_step,
+            shared_threshold,
         ),
+        make_results_kpi_board(shared_threshold, threshold_store["current"], sim_step, dispute_cost, review_cost),
+        make_adaptive_over_time_figure(feedback_store.get("time_history", {})),
+        make_field_health_cards(health_records),
+        make_field_health_heatmap(health_records),
         make_audit_policy_panel(batch_events, audit_time_step),
-        make_audit_rate_over_time_figure(24, audit_time_step),
+        make_audit_rate_over_time_figure(10, audit_time_step),
         make_threshold_matrix_table(threshold_store),
         make_field_threshold_trend_figure(threshold_store, trend_camera or "1"),
     )
@@ -1622,4 +2669,4 @@ server = app.server
 
 if __name__ == "__main__":
     export_dataset_csv()
-    app.run(debug=True)
+    app.run(debug=False, use_reloader=False, dev_tools_hot_reload=False)
